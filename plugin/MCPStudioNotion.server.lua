@@ -1,0 +1,4719 @@
+local VERSAO = "2.9.0"
+
+local HttpService = game:GetService("HttpService")
+local Selection = game:GetService("Selection")
+local ChangeHistoryService = game:GetService("ChangeHistoryService")
+local ScriptEditorService = game:GetService("ScriptEditorService")
+local InsertService = game:GetService("InsertService")
+local LogService = game:GetService("LogService")
+local CollectionService = game:GetService("CollectionService")
+local MarketplaceService = game:GetService("MarketplaceService")
+
+local urlBase = ""
+local chave = ""
+local conectado = false
+local esperaMs = 25000
+local peer = string.gsub(HttpService:GenerateGUID(false), "[{}-]", "")
+peer = string.sub(peer, 1, 12)
+
+local filaLocal = {}
+local bufferRespostas = {}
+local enviando = false
+local geracao = 0
+
+local RunService = game:GetService("RunService")
+local ORCAMENTO_MIN = 0.004
+local ORCAMENTO_MAX = 0.04
+local FRACAO_QUADRO = 0.3
+local quadro = { inicio = os.clock(), seq = 0, dt = 1 / 60, orcamento = 0.006 }
+local function ajustarOrcamento(dt)
+	quadro.dt = dt
+	quadro.orcamento = math.clamp(dt * FRACAO_QUADRO, ORCAMENTO_MIN, ORCAMENTO_MAX)
+end
+pcall(function()
+	RunService.Heartbeat:Connect(function(dt)
+		quadro.seq = quadro.seq + 1
+		quadro.inicio = os.clock()
+		ajustarOrcamento(tonumber(dt) or quadro.dt)
+	end)
+end)
+local function quadroEstourado()
+	return os.clock() - quadro.inicio >= quadro.orcamento
+end
+
+local function cederQuadro()
+	local seq = quadro.seq
+	local dt = task.wait()
+	if quadro.seq == seq then
+		quadro.inicio = os.clock()
+		ajustarOrcamento(tonumber(dt) or quadro.dt)
+	end
+	return dt
+end
+
+local function novoOrcamento()
+	return { passos = 0, passada = 8, checagem = os.clock() }
+end
+local function respirar(orcamento)
+	orcamento.passos = orcamento.passos + 1
+	if orcamento.passos % orcamento.passada ~= 0 then
+		return
+	end
+	local agora = os.clock()
+	local gasto = agora - orcamento.checagem
+	orcamento.checagem = agora
+	if gasto > quadro.orcamento / 4 then
+		orcamento.passada = math.max(1, math.floor(orcamento.passada / 2))
+	elseif gasto < quadro.orcamento / 64 then
+		orcamento.passada = math.min(64, orcamento.passada * 2)
+	end
+	if quadroEstourado() and coroutine.isyieldable() then
+		cederQuadro()
+		orcamento.checagem = os.clock()
+	end
+end
+
+local contaOk = 0
+local contaErro = 0
+local ultimaFerramenta = ""
+local ultimoErro = ""
+
+local porId = setmetatable({}, { __mode = "v" })
+local porInst = setmetatable({}, { __mode = "k" })
+local proximoId = 0
+
+local function idDe(inst)
+	if inst == nil then
+		return nil
+	end
+	local id = porInst[inst]
+	if id ~= nil then
+		return id
+	end
+	proximoId = proximoId + 1
+	id = "i_" .. peer .. "_" .. tostring(proximoId)
+	porInst[inst] = id
+	porId[id] = inst
+	return id
+end
+
+local function caminhoDe(inst)
+	if inst == nil then
+		return nil
+	end
+	if inst == game then
+		return "game"
+	end
+	local ok, nome = pcall(function()
+		return inst:GetFullName()
+	end)
+	if ok and type(nome) == "string" and nome ~= "" then
+		return "game." .. nome
+	end
+	return inst.Name
+end
+
+local function vivo(inst)
+	if inst == nil then
+		return false
+	end
+	if inst == game then
+		return true
+	end
+	local ok, res = pcall(function()
+		return inst:IsDescendantOf(game)
+	end)
+	return ok and res == true
+end
+
+local function resolver(ref, opcional)
+	if ref == nil or ref == "" then
+		if opcional then
+			return nil
+		end
+		error("faltou informar o caminho ou o id da instancia", 0)
+	end
+	if typeof(ref) == "Instance" then
+		return ref
+	end
+	local txt = tostring(ref)
+	if string.match(txt, "^i_[%w_]+$") then
+		local inst = porId[txt]
+		if vivo(inst) then
+			return inst
+		end
+		error("o id " .. txt .. " aponta para algo que nao existe mais no place; leia de novo com get_tree ou find_instances", 0)
+	end
+	txt = string.gsub(txt, "^%s+", "")
+	txt = string.gsub(txt, "%s+$", "")
+	txt = string.gsub(txt, "/", ".")
+	txt = string.gsub(txt, "^%.+", "")
+	txt = string.gsub(txt, "^[Gg]ame%.", "")
+	if txt == "" or string.lower(txt) == "game" then
+		return game
+	end
+	local atual = game
+	for parte in string.gmatch(txt, "[^%.]+") do
+		local prox = nil
+		if atual == game then
+			local okServico, servico = pcall(function()
+				return game:GetService(parte)
+			end)
+			if okServico then
+				prox = servico
+			end
+		end
+		if prox == nil then
+			prox = atual:FindFirstChild(parte)
+		end
+		if prox == nil then
+			if opcional then
+				return nil
+			end
+			error('nao achei "' .. parte .. '" dentro de ' .. tostring(caminhoDe(atual)) .. ' (referencia recebida: ' .. tostring(ref) .. ')', 0)
+		end
+		atual = prox
+	end
+	return atual
+end
+
+local criarControle = (function()
+return function(deps)
+	local c = {
+		locks = {}, active = {}, agents = {}, audit = {}, sequence = 0,
+		versions = setmetatable({}, { __mode = "k" }),
+		config = { readGraceSeconds = 8, manualSeconds = 120, maxManualSeconds = 900, maxLocks = 2000, maxAgents = 256 },
+	}
+	local now = deps.clock
+	local function fail(code, message, extra)
+		local e = extra or {}
+		e.code, e.message, e.nothingExecuted = code, message, true
+		error(e, 0)
+	end
+	local function nextId(prefix)
+		c.sequence = c.sequence + 1
+		return prefix .. tostring(c.sequence)
+	end
+	local function describe(l)
+		return {
+			lockId = l.id, agent = l.agent, target = deps.id(l.target), path = deps.path(l.target),
+			kind = l.kind, recursive = l.recursive == true, mode = l.mode,
+			expiresInMs = l.untilAt and math.max(0, math.ceil((l.untilAt - now()) * 1000)) or nil,
+			tool = l.tool, note = l.note,
+		}
+	end
+	local function overlaps(a, b)
+		return a.target == b.target
+			or (a.recursive == true and deps.descendant(b.target, a.target))
+			or (b.recursive == true and deps.descendant(a.target, b.target))
+	end
+	function c:log(action, agent, details)
+		table.insert(self.audit, { action = action, agent = agent, atMs = deps.wallMs(), details = details })
+		while #self.audit > 100 do table.remove(self.audit, 1) end
+	end
+	function c:configure(config)
+		if type(config) ~= "table" then return end
+		local bounds = { readGraceSeconds = { 1, 300 }, manualSeconds = { 5, 900 }, maxManualSeconds = { 5, 900 } }
+		for key, range in pairs(bounds) do
+			local n = tonumber(config[key])
+			if n and n == n then self.config[key] = math.max(range[1], math.min(range[2], n)) end
+		end
+		self.config.manualSeconds = math.min(self.config.manualSeconds, self.config.maxManualSeconds)
+	end
+	function c:gc()
+		local t = now()
+		for id, l in pairs(self.locks) do
+			local dead = not deps.alive(l.target)
+			local orphan = l.mode == "active" and self.active[l.context] == nil
+
+			if dead or orphan or (l.mode ~= "active" and l.untilAt <= t) then
+				self.locks[id] = nil
+			end
+		end
+		for agent, entry in pairs(self.agents) do
+			if t - entry.lastSeen > 3600 then
+				local busy = false
+				for _, l in pairs(self.locks) do if l.agent == agent then busy = true; break end end
+				if not busy then self.agents[agent] = nil end
+			end
+		end
+	end
+	function c:touch(agent)
+		if type(agent) ~= "string" or agent == "" then
+			fail("AGENT_REQUIRED", "Identidade ausente. Use agent_open e passe o agent devolvido em todas as chamadas.")
+		end
+		self:gc()
+		local a = self.agents[agent]
+		if not a then
+			local n = 0
+			for _ in pairs(self.agents) do n = n + 1 end
+			if n >= self.config.maxAgents then fail("AGENT_LIMIT", "Limite de agentes ativos. Encerre agentes com agent_close.") end
+			a = { reads = setmetatable({}, { __mode = "k" }) }
+			self.agents[agent] = a
+		end
+		a.lastSeen = now()
+		return a
+	end
+	function c:normalize(plans)
+		local out = {}
+		for _, p in ipairs(plans or {}) do
+			if p.target == nil or not deps.alive(p.target) then fail("TARGET_GONE", "Uma instancia do pedido nao existe mais. Leia a arvore novamente.") end
+			if p.kind ~= "read" and p.kind ~= "write" then fail("BAD_LOCK_KIND", "kind deve ser read ou write.") end
+			local found = nil
+			for _, old in ipairs(out) do if old.target == p.target then found = old; break end end
+			if found then
+				if p.kind == "write" then found.kind = "write" end
+				found.recursive = found.recursive or p.recursive == true
+				found.keepRead = found.keepRead or p.keepRead == true
+			else
+				table.insert(out, { target = p.target, kind = p.kind, recursive = p.recursive == true, keepRead = p.keepRead == true })
+			end
+		end
+		return out
+	end
+	function c:preflight(agent, plans)
+		self:touch(agent)
+		local conflicts, seen, retry = {}, {}, 0
+		local count = 0
+		for _, l in pairs(self.locks) do
+			count = count + 1
+			if l.agent ~= agent then
+				for _, p in ipairs(plans) do
+					if (p.kind == "write" or l.kind == "write") and overlaps(p, l) and not seen[l.id] then
+						seen[l.id] = true
+						local d = describe(l)
+						table.insert(conflicts, d)
+						retry = math.max(retry, d.expiresInMs or 1000)
+					end
+				end
+			end
+		end
+		if #conflicts > 0 then
+			self:log("conflict", agent, { count = #conflicts, first = conflicts[1] })
+			fail("LOCK_CONFLICT", "Chamada recusada INTEIRA antes de executar: outro agente esta lendo ou escrevendo um alvo. Consulte file_locks e tente depois; nao contorne com outra ferramenta.", { conflicts = conflicts, retryAfterMs = math.max(100, retry) })
+		end
+		if count + #plans > self.config.maxLocks then fail("LOCK_LIMIT", "Limite de travas atingido. Libere reservas e tente novamente.") end
+	end
+	function c:begin(agent, plans, tool)
+		local normalized = self:normalize(plans)
+		self:preflight(agent, normalized)
+		local ctx = { id = nextId("ctx_"), agent = agent, plans = normalized, tool = tool, cleanups = {}, recordings = {}, done = false }
+		self.active[ctx.id] = ctx
+		for _, p in ipairs(normalized) do
+			local id = nextId("lock_")
+			self.locks[id] = { id = id, agent = agent, target = p.target, kind = p.kind, recursive = p.recursive, mode = "active", context = ctx.id, tool = tool }
+		end
+		self:log("begin", agent, { tool = tool, targets = #normalized })
+		return ctx
+	end
+	function c:finish(ctx, success)
+		if ctx.done then return end
+		ctx.done = true
+		self.active[ctx.id] = nil
+		for id, l in pairs(self.locks) do
+			if l.context == ctx.id then self.locks[id] = nil end
+		end
+		if success then
+
+			for _, p in ipairs(ctx.plans) do
+				if p.kind == "write" then
+					for id, l in pairs(self.locks) do
+						if l.agent == ctx.agent and l.mode == "grace" and overlaps(l, p) then self.locks[id] = nil end
+					end
+				end
+			end
+			for _, p in ipairs(ctx.plans) do
+				if p.kind == "read" and p.keepRead and deps.alive(p.target) then
+					local existing = nil
+					for _, l in pairs(self.locks) do
+						if l.agent == ctx.agent and l.mode == "grace" and l.target == p.target then existing = l; break end
+					end
+					local id = existing and existing.id or nextId("lock_")
+					self.locks[id] = { id = id, agent = ctx.agent, target = p.target, recursive = p.recursive, kind = "read", mode = "grace", untilAt = now() + self.config.readGraceSeconds, tool = ctx.tool }
+				end
+			end
+		end
+		self:gc()
+		self:log("finish", ctx.agent, { tool = ctx.tool, success = success })
+	end
+	function c:reserve(agent, plans, seconds, note)
+		local normalized = self:normalize(plans)
+		if #normalized == 0 then fail("TARGET_REQUIRED", "Informe ao menos um alvo em targets.") end
+		local ttl = tonumber(seconds) or self.config.manualSeconds
+		if ttl ~= ttl or ttl < 5 or ttl > self.config.maxManualSeconds then
+			fail("BAD_TTL", "seconds deve estar entre 5 e " .. self.config.maxManualSeconds .. ".")
+		end
+
+		self:preflight(agent, normalized)
+		local result = {}
+		for _, p in ipairs(normalized) do
+			for id, l in pairs(self.locks) do
+				if l.agent == agent and l.target == p.target and l.mode == "manual" then self.locks[id] = nil end
+			end
+			local id = nextId("lock_")
+			local l = { id = id, agent = agent, target = p.target, recursive = p.recursive, kind = p.kind, mode = "manual", untilAt = now() + ttl, note = note }
+			self.locks[id] = l
+			table.insert(result, describe(l))
+		end
+		self:log("reserve", agent, { count = #result, seconds = ttl })
+		return { agent = agent, locks = result, seconds = ttl }
+	end
+	function c:release(agent, targets, all)
+		self:touch(agent)
+		if not all and #targets == 0 then fail("TARGET_REQUIRED", "Informe targets ou all=true para liberar somente suas proprias travas.") end
+		local count = 0
+		for id, l in pairs(self.locks) do
+			local matches = all
+			for _, target in ipairs(targets) do if target == l.target then matches = true end end
+			if matches and l.agent == agent and l.mode ~= "active" then
+				self.locks[id] = nil
+				count = count + 1
+			end
+		end
+
+		self:log("release", agent, { count = count })
+		return { agent = agent, released = count }
+	end
+	function c:close(agent)
+		local result = self:release(agent, {}, true)
+		local busy = false
+		for _, ctx in pairs(self.active) do if ctx.agent == agent and ctx.tool ~= "agent_close" then busy = true end end
+		if not busy then self.agents[agent] = nil end
+		result.closed = not busy
+		return result
+	end
+	function c:list(agent, mine, offset, limit)
+		self:gc()
+		local all = {}
+		for _, l in pairs(self.locks) do
+			if not mine or l.agent == agent then table.insert(all, describe(l)) end
+		end
+		table.sort(all, function(a, b) return a.lockId < b.lockId end)
+		local start = math.max(0, math.floor(tonumber(offset) or 0))
+		local n = math.max(1, math.min(500, math.floor(tonumber(limit) or 100)))
+		local result = {}
+		for i = start + 1, math.min(#all, start + n) do table.insert(result, all[i]) end
+		local audit = {}
+		for i = math.max(1, #self.audit - 19), #self.audit do table.insert(audit, self.audit[i]) end
+		return { agent = agent, locks = result, total = #all, nextOffset = start + n < #all and (start + n) or nil, readGraceSeconds = self.config.readGraceSeconds, audit = audit }
+	end
+	function c:version(target, source)
+		local v = self.versions[target]
+		if not v or v.source ~= source then
+			v = { source = source, revision = deps.epoch .. ":" .. nextId("rev_") }
+			self.versions[target] = v
+		end
+		return v.revision
+	end
+	function c:read(agent, target, source)
+		local a = self:touch(agent)
+		local rev = self:version(target, source)
+		a.reads[target] = rev
+		return rev
+	end
+	function c:checkVersion(agent, target, source, expected, required)
+		local a = self:touch(agent)
+		local current = self:version(target, source)
+		local previous = expected or a.reads[target]
+		if required and not previous then
+			fail("READ_REQUIRED", "Leia o script com get_script antes de alterar Source (ou informe expectedRevision da leitura atual).", { target = deps.id(target), path = deps.path(target), currentRevision = current })
+		end
+		if previous and previous ~= current then
+			self:log("stale-write", agent, { target = deps.id(target) })
+			fail("STALE_REVISION", "O script mudou depois da sua leitura. Leia novamente com get_script e refaca a edicao sobre a versao atual.", { target = deps.id(target), path = deps.path(target), expectedRevision = previous, currentRevision = current })
+		end
+		return current
+	end
+	function c:checkObserved(agent, readSource, root)
+		local a = self:touch(agent)
+		for target in pairs(a.reads) do
+			if deps.alive(target) and (not root or target == root or deps.descendant(target, root)) then
+				self:checkVersion(agent, target, readSource(target), nil, false)
+			end
+		end
+	end
+
+	function c:foreign(agent)
+		self:gc()
+		local out, seen = {}, {}
+		for _, l in pairs(self.locks) do
+			if l.agent ~= agent and deps.alive(l.target) then
+				local entry = seen[l.target]
+				if entry then
+					entry.recursive = entry.recursive or l.recursive == true
+				else
+					entry = { target = l.target, recursive = l.recursive == true, agent = l.agent }
+					seen[l.target] = entry
+					table.insert(out, entry)
+				end
+			end
+		end
+		return out
+	end
+	function c:summary()
+		self:gc()
+		local locks, agents, active = 0, 0, 0
+		for _ in pairs(self.locks) do locks = locks + 1 end
+		for _ in pairs(self.agents) do agents = agents + 1 end
+		for _ in pairs(self.active) do active = active + 1 end
+		return { version = 1, enabled = true, locks = locks, agents = agents, active = active, readGraceSeconds = self.config.readGraceSeconds, runLuau = "free" }
+	end
+	return c
+end
+
+end)()
+local criarRunLuau = (function()
+return function(d)
+ local FATIA_MAX=0.05
+ local LIMITE_SEM_YIELD=0.5
+ local LIMITE_IMPRESSOES=300
+ local PALAVRAS_LOOP={['do']=true,['repeat']=true}
+ local METODOS_CONEXAO={Connect=true,ConnectParallel=true,Once=true}
+
+ local frame=d.frame
+ if type(frame)~='table' or type(frame.exceeded)~='function' or type(frame.yield)~='function' then
+  local inicio,orc=d.clock(),0.008
+  frame={
+   exceeded=function()return d.clock()-inicio>=orc end,
+   yield=function()local dt=tonumber(d.task.wait()) or 0;orc=math.max(0.004,math.min(0.04,dt*0.3));inicio=d.clock();return dt end,
+  }
+ end
+ local function fecharLongo(code,i,nivel)
+  local fim=string.find(code,']'..string.rep('=',nivel)..']',i,true)
+  return fim and fim+nivel+1 or #code
+ end
+
+ local function instrumentar(code)
+  local out,i,n={},1,#code
+  local pilha={}
+  local ultimoSignificativo=''
+  local aguardandoParams=false
+  local function emitir(s)table.insert(out,s)end
+  while i<=n do
+   local c=string.sub(code,i,i)
+   if c=='-' and string.sub(code,i+1,i+1)=='-' then
+    local nivel=string.match(code,'^%-%-%[(=*)%[',i)
+    local fim
+    if nivel then fim=fecharLongo(code,i+3+#nivel,#nivel) else fim=(string.find(code,'\n',i,true) or n+1)-1 end
+    emitir(string.sub(code,i,fim));i=fim+1
+   elseif c=='"' or c=="'" or c=='`' then
+    local j=i+1
+    while j<=n do
+     local ch=string.sub(code,j,j)
+     if ch=='\\' then j=j+2
+     elseif ch==c then break
+     elseif ch=='\n' and c~='`' then break
+     else j=j+1 end
+    end
+    emitir(string.sub(code,i,j));i=j+1;ultimoSignificativo='str';aguardandoParams=false
+   elseif c=='[' and string.match(code,'^%[=*%[',i) then
+    local nivel=#string.match(code,'^%[(=*)%[',i)
+    local fim=fecharLongo(code,i+2+nivel,nivel)
+    emitir(string.sub(code,i,fim));i=fim+1;ultimoSignificativo='str';aguardandoParams=false
+   elseif string.match(c,'[%a_]') then
+    local palavra=string.match(code,'^[%w_]+',i)
+    local depois=i+#palavra
+    if PALAVRAS_LOOP[palavra] and ultimoSignificativo~='.' and ultimoSignificativo~=':' then
+     emitir(palavra..' __mcp_tick();')
+    elseif METODOS_CONEXAO[palavra] and ultimoSignificativo==':' then
+     local paren=string.match(code,'^%s*%(',depois)
+     if paren then
+      emitir(palavra..paren..'__mcp_cb(');depois=depois+#paren;table.insert(pilha,true)
+     else emitir(palavra)end
+    else
+     emitir(palavra)
+     if palavra=='function' and ultimoSignificativo~='.' and ultimoSignificativo~=':' then aguardandoParams=true end
+    end
+    i=depois;ultimoSignificativo=palavra
+   elseif string.match(c,'%d') then
+    local num=string.match(code,'^0[xX][%x_]+',i) or string.match(code,'^0[bB][01_]+',i) or string.match(code,'^[%d_]*%.?[%d_]*[eE][%+%-]?%d+',i) or string.match(code,'^[%d_]*%.?[%d_]+',i) or c
+    emitir(num);i=i+#num;ultimoSignificativo='num';aguardandoParams=false
+   elseif c=='(' then
+    emitir(c)
+    if aguardandoParams then table.insert(pilha,'fn');aguardandoParams=false else table.insert(pilha,false)end
+    i=i+1;ultimoSignificativo=c
+   elseif c==')' then
+    local marcado=table.remove(pilha)
+    if marcado=='fn' then
+
+     local proximo=string.match(code,'^%s*(%S)',i+1)
+     emitir(proximo==':' and ')' or ') __mcp_tick();')
+    else emitir(marcado and '))' or ')')end
+    i=i+1;ultimoSignificativo=c
+   else
+    emitir(c);i=i+1
+    if not string.match(c,'%s') then ultimoSignificativo=c end
+   end
+  end
+  if #pilha>0 then return nil end
+  return table.concat(out)
+ end
+ return function(a,ctx)
+  local code=tostring(a.code or '')
+  if code=='' then error('informe code',0)end
+  if type(d.compile)~='function' or type(d.setEnvironment)~='function' then error('Este Studio nao disponibiliza loadstring/setfenv para plugins. Confira permissoes/versao do Studio; o modo controlado nao desativa run_luau.',0)end
+  local fn,syntax=d.compile(code,'=mcp-run-luau');if not fn then error('erro de sintaxe no codigo: '..tostring(syntax),0)end
+
+  local instrumentado=instrumentar(code)
+  if not instrumentado then error({code='WATCHDOG_UNAVAILABLE',message='run_luau bloqueado: nao consegui inserir pontos de yield neste codigo (parenteses desbalanceados fora de strings?). Sem watchdog preemptivo o codigo poderia congelar o Studio; simplifique a sintaxe e repita. Nada foi executado.',nothingExecuted=true},0)end
+  local fnInst,erroInst=d.compile(instrumentado,'=mcp-run-luau')
+  if not fnInst then error({code='WATCHDOG_UNAVAILABLE',message='run_luau bloqueado: o codigo compila, mas a versao com pontos de yield nao ('..tostring(erroInst)..'). Sem watchdog preemptivo o codigo poderia congelar o Studio. Evite construcoes incomuns (ex.: anotacoes de tipo complexas) e repita. Nada foi executado.',nothingExecuted=true},0)end
+  fn=fnInst
+  local watchdog='preemptivo'
+  local threads,connections,output={},{},{}
+  local firstError,cleaned,closed,spawned=nil,false,false,0
+  local start=d.clock()
+  local mantidos=setmetatable({},{__mode='k'})
+  local ultimoYield,ultimaChecagem,passos,passada=start,start,0,8
+  local impressoes,suprimidas=0,0
+  local function encerrado()return closed or ctx.cancelled or ctx.done end
+  local function abortar(motivo,codigo)
+   error({code=codigo or (ctx.cancelled and 'CANCELLED' or 'EXECUTION_TIMEOUT'),message=motivo},0)
+  end
+  local function marcarYield()
+   ultimoYield=d.clock();ultimaChecagem=ultimoYield;passos=0
+  end
+  local function tick()
+   passos=passos+1
+   if passos%passada~=0 then return end
+   if encerrado() then abortar('run_luau interrompido pelo watchdog (prazo/cancelamento). O Studio nao foi travado; confira o estado antes de repetir.')end
+   local agora=d.clock()
+   local gasto=agora-ultimaChecagem;ultimaChecagem=agora
+
+   if gasto>0.002 then passada=math.max(1,math.floor(passada/2))
+   elseif gasto<0.0001 then passada=math.min(64,passada*2)end
+   if ctx.deadline and agora>=ctx.deadline then ctx.cancelled=true;abortar('run_luau excedeu o prazo e foi interrompido pelo watchdog antes de travar o Studio.')end
+   local semYield=agora-ultimoYield
+   if frame.exceeded() or semYield>=FATIA_MAX then
+    if coroutine.isyieldable() then
+     frame.yield()
+     marcarYield()
+     if encerrado() then abortar('run_luau interrompido pelo watchdog apos ceder o quadro.')end
+    elseif semYield>=LIMITE_SEM_YIELD then
+     ctx.cancelled=true
+     abortar('run_luau bloqueado: o codigo passou '..math.floor(semYield*1000)..'ms sem um ponto onde possa ceder o quadro (trabalho pesado dentro de table.sort, string.gsub com funcao ou metametodo?). Mova o trabalho para fora desse contexto ou reduza o volume. O Studio nao foi travado.','NO_YIELD_POINT')
+    end
+   end
+  end
+  local function envolverCallback(f)
+   if type(f)~='function' or mantidos[f] then return f end
+   return function(...)
+    if encerrado() then return end
+    marcarYield()
+    return f(...)
+   end
+  end
+  local function live(t)return coroutine.status(t)~='dead'end
+  local function cancel(t)if live(t)then d.task.cancel(t)end end
+  local function cleanup()
+   closed=true;if cleaned then return end
+   local failure=nil
+   for t in pairs(threads)do local ok,e=pcall(cancel,t);if not ok then failure=tostring(e)end end
+   for _,conn in ipairs(connections)do local ok,e=pcall(function()conn:Disconnect()end);if not ok then failure=tostring(e)end end
+   if failure then error('Falha ao encerrar escopo Luau: '..failure,0)end
+   cleaned=true
+  end
+  table.insert(ctx.cleanups,cleanup)
+  table.insert(connections,d.log:Connect(function(message,kind)
+   if not closed and #output<200 then table.insert(output,{message=tostring(message),type=tostring(kind):gsub('Enum.MessageType.Message','')})end
+  end))
+  local function child(callback,...)
+   if encerrado() then error('Escopo run_luau encerrado.',0)end
+   spawned=spawned+1;if spawned>512 then error('Limite de 512 tarefas filhas por chamada.',0)end
+   local t
+   if type(callback)=='thread' then t=callback
+   elseif type(callback)=='function' then
+    t=coroutine.create(function(...)local ok,e=pcall(callback,...);if not ok then firstError=firstError or tostring(type(e)=='table' and e.message or e)end end)
+   else error('task espera funcao ou coroutine',0)end
+   threads[t]=true;return t,table.pack(...)
+  end
+  local wrapped={}
+  wrapped.spawn=function(callback,...)local t,args=child(callback,...);d.task.spawn(t,table.unpack(args,1,args.n));return t end
+  wrapped.defer=function(callback,...)local t,args=child(callback,...);d.task.defer(t,table.unpack(args,1,args.n));return t end
+  wrapped.delay=function(seconds,callback,...)local t,args=child(callback,...);d.task.delay(seconds,t,table.unpack(args,1,args.n));return t end
+  wrapped.cancel=function(t)if not threads[t]then error('So cancele tarefas filhas desta chamada.',0)end;cancel(t);threads[t]=nil end
+  wrapped.wait=function(...)local r=d.task.wait(...);marcarYield();return r end
+  setmetatable(wrapped,{__index=d.task,__metatable='MCP task scope'})
+
+  local function limitar(nativo)
+   if type(nativo)~='function' then return nativo end
+   return function(...)
+    impressoes=impressoes+1
+    if impressoes>LIMITE_IMPRESSOES then suprimidas=suprimidas+1;return end
+    return nativo(...)
+   end
+  end
+  local env=setmetatable({task=wrapped,spawn=wrapped.spawn,delay=wrapped.delay,wait=wrapped.wait,__mcp_tick=tick,__mcp_cb=envolverCallback,MCP={agent=ctx.agent,
+   isCancelled=encerrado,
+   checkpoint=function()if encerrado() then error('run_luau cancelado',0)end;return wrapped.wait()end,
+   trackConnection=function(conn)if closed then error('Escopo encerrado',0)end;table.insert(connections,conn);return conn end,
+   keep=function(f)if type(f)=='function' then mantidos[f]=true end;return f end,
+  }},{__index=d.environment})
+  env.print=limitar(d.environment and d.environment.print)
+  env.warn=limitar(d.environment and d.environment.warn)
+
+  local requireNativo=d.require or (d.environment and d.environment.require)
+  local ehModulo=function(x)local ok,isa=pcall(function()return typeof(x)=='Instance' and x:IsA('ModuleScript')end);return ok and isa==true end
+  local memo,carregando,modulosFrescos={},{},{}
+  local function requireFresco(alvo)
+   if not ehModulo(alvo)then
+    if type(requireNativo)~='function' then error('require indisponivel neste ambiente',0)end
+    return requireNativo(alvo)
+   end
+   local hit=memo[alvo];if hit then return hit.value end
+   local caminho=d.path and d.path(alvo) or tostring(alvo)
+   if carregando[alvo] then error('require ciclico detectado em '..caminho,0)end
+   local okSrc,src=pcall(d.source,alvo);if not okSrc then error('nao consegui ler o codigo de '..caminho..': '..tostring(src),0)end
+
+   local corpo=instrumentar(src)
+   if not corpo then error({code='WATCHDOG_UNAVAILABLE',message='require fresco bloqueado: nao consegui inserir pontos de yield em '..caminho..'. Use MCP.require(m,{fresh=false}) para o require nativo se o modulo ja estiver validado.'},0)end
+   local mfn,err=d.compile(corpo,'='..caminho)
+   if not mfn then
+
+    local okOrig,errOrig=d.compile(src,'='..caminho)
+    if not okOrig then error('erro de sintaxe em '..caminho..': '..tostring(errOrig),0)end
+    error({code='WATCHDOG_UNAVAILABLE',message='require fresco bloqueado: a versao com pontos de yield de '..caminho..' nao compila ('..tostring(err)..'). Use MCP.require(m,{fresh=false}) para o require nativo.'},0)
+   end
+   carregando[alvo]=true
+   local menv=setmetatable({script=alvo,require=requireFresco},{__index=env})
+   d.setEnvironment(mfn,menv)
+   local okRun,valores=pcall(function()return table.pack(mfn())end)
+   carregando[alvo]=nil
+   if not okRun then error('erro ao executar '..caminho..': '..tostring(type(valores)=='table' and valores.message or valores),0)end
+   if valores.n~=1 or valores[1]==nil then error('O modulo '..caminho..' nao retornou exatamente um valor (retornou '..tostring(valores.n)..'), como exige o require do Roblox',0)end
+   memo[alvo]={value=valores[1]};table.insert(modulosFrescos,caminho)
+   return valores[1]
+  end
+  local fresco
+  if a.freshRequire~=nil then fresco=(a.freshRequire==true) else fresco=(d.freshDefault~=false) end
+  if fresco and type(d.source)=='function' then env.require=requireFresco else fresco=false end
+  env.MCP.require=function(alvo,opts)
+   if type(opts)=='table' and opts.fresh==false then return requireNativo(alvo)end
+   return requireFresco(alvo)
+  end
+  d.setEnvironment(fn,env)
+  local ok,result=pcall(function()
+   return d.history(tostring(a.undoLabel or 'MCP run_luau'),function()
+    local values=table.pack(fn())
+    while true do
+     if firstError then error('erro em tarefa filha: '..firstError,0)end
+     local pending=false;for t in pairs(threads)do if live(t)then pending=true else threads[t]=nil end end
+     if not pending then break end;d.task.wait(.02)
+    end
+    local encoded={};for i=1,values.n do
+     if values[i]==nil then encoded[i]={type='nil'}else encoded[i]=d.encode(values[i])end
+    end
+    local r={returned=encoded,returnCount=values.n,output=output,ms=math.floor((d.clock()-start)*1000),controlled=true,lockScope='none',tasksSpawned=spawned,watchdog=watchdog,freshRequire=fresco,freshModules=modulosFrescos}
+    if suprimidas>0 then
+     r.outputSuppressed=suprimidas
+     r.warnings={'run_luau imprimiu '..impressoes..' linhas; apenas as primeiras '..LIMITE_IMPRESSOES..' foram enviadas ao Output para nao congelar o Studio. Agregue os dados e retorne-os em vez de imprimir linha a linha.'}
+    end
+    return r
+   end)
+  end)
+  cleanup()
+  if not ok then
+   local codigo=type(result)=='table' and result.code or 'LUAU_ERROR'
+   error({code=codigo,message=tostring(type(result)=='table' and result.message or result),nothingExecuted=false,output=output},0)
+  end
+  return result
+ end
+end
+
+end)()
+local contextoAtual=nil
+
+local estadoTeste=function()return nil end
+local iniciarRelay,pararRelay,acordarRelay=function()end,function()end,function()end
+local reiniciarBackfillRelay=function()return 0 end
+
+local live={ativa=function()return false end,resumo=function()return nil end,aposEscrita=function()end}
+
+local novoControle=(function()
+ local controleGeracao=0
+ return function()
+  controleGeracao=controleGeracao+1
+  return criarControle({clock=os.clock,wallMs=function()return DateTime.now().UnixTimestampMillis end,epoch=peer..":c"..tostring(controleGeracao),id=idDe,path=caminhoDe,alive=vivo,descendant=function(child,parent)return child:IsDescendantOf(parent)end})
+ end
+end)()
+local controle=novoControle()
+
+local LARGURA_MAX_TABELA = 2000
+
+local function corHex(cor)
+	local function bit(x)
+		return math.floor(math.clamp(x, 0, 1) * 255 + 0.5)
+	end
+	return string.format("#%02x%02x%02x", bit(cor.R), bit(cor.G), bit(cor.B))
+end
+
+local function codificar(v, profundidade)
+	profundidade = profundidade or 0
+	local t = typeof(v)
+	if t == "number" or t == "string" or t == "boolean" then
+		if t == "number" and (v ~= v or v == math.huge or v == -math.huge) then
+			return tostring(v)
+		end
+		return v
+	end
+	if t == "nil" then
+		return nil
+	end
+	if t == "Vector3" then
+		return { x = v.X, y = v.Y, z = v.Z }
+	end
+	if t == "Vector2" then
+		return { x = v.X, y = v.Y }
+	end
+	if t == "Vector3int16" or t == "Vector2int16" then
+		return { x = v.X, y = v.Y, z = (t == "Vector3int16") and v.Z or nil }
+	end
+	if t == "Color3" then
+		return corHex(v)
+	end
+	if t == "BrickColor" then
+		return v.Name
+	end
+	if t == "CFrame" then
+		local rx, ry, rz = v:ToOrientation()
+		return {
+			position = { x = v.Position.X, y = v.Position.Y, z = v.Position.Z },
+			orientation = { x = math.deg(rx), y = math.deg(ry), z = math.deg(rz) },
+		}
+	end
+	if t == "UDim" then
+		return { scale = v.Scale, offset = v.Offset }
+	end
+	if t == "UDim2" then
+		return { x = { scale = v.X.Scale, offset = v.X.Offset }, y = { scale = v.Y.Scale, offset = v.Y.Offset } }
+	end
+	if t == "Rect" then
+		return { min = { x = v.Min.X, y = v.Min.Y }, max = { x = v.Max.X, y = v.Max.Y } }
+	end
+	if t == "NumberRange" then
+		return { min = v.Min, max = v.Max }
+	end
+	if t == "NumberSequence" then
+		local saida = {}
+		for _, k in ipairs(v.Keypoints) do
+			table.insert(saida, { time = k.Time, value = k.Value, envelope = k.Envelope })
+		end
+		return saida
+	end
+	if t == "ColorSequence" then
+		local saida = {}
+		for _, k in ipairs(v.Keypoints) do
+			table.insert(saida, { time = k.Time, value = corHex(k.Value) })
+		end
+		return saida
+	end
+	if t == "EnumItem" then
+		return v.Name
+	end
+	if t == "Enum" or t == "Enums" then
+		return tostring(v)
+	end
+	if t == "Font" then
+		return { family = v.Family, weight = v.Weight.Name, style = v.Style.Name }
+	end
+	if t == "Instance" then
+		return caminhoDe(v)
+	end
+	if t == "table" then
+		if profundidade > 6 then
+			return "[tabela profunda]"
+		end
+
+		local saida = {}
+		local ehArray = #v > 0
+		if ehArray then
+			for i, item in ipairs(v) do
+				if i > LARGURA_MAX_TABELA then
+					table.insert(saida, "[... mais " .. (#v - LARGURA_MAX_TABELA) .. " itens omitidos; filtre ou pagine]")
+					break
+				end
+				table.insert(saida, codificar(item, profundidade + 1))
+			end
+		else
+			local n = 0
+			for k, item in pairs(v) do
+				n = n + 1
+				if n > LARGURA_MAX_TABELA then
+					saida["__truncated"] = "mais chaves omitidas; filtre ou pagine"
+					break
+				end
+				local valor = codificar(item, profundidade + 1)
+				if valor ~= nil then
+					saida[tostring(k)] = valor
+				end
+			end
+		end
+		return saida
+	end
+	return tostring(v)
+end
+
+local function numeros(v)
+	if type(v) ~= "table" then
+		return nil
+	end
+	if #v > 0 then
+		local saida = {}
+		for i, n in ipairs(v) do
+			saida[i] = tonumber(n) or 0
+		end
+		return saida
+	end
+	local x = v.x or v.X
+	local y = v.y or v.Y
+	local z = v.z or v.Z
+	if x ~= nil or y ~= nil or z ~= nil then
+		return { tonumber(x) or 0, tonumber(y) or 0, tonumber(z) or 0 }
+	end
+	return nil
+end
+
+local function paraCor(v)
+	if typeof(v) == "Color3" then
+		return v
+	end
+	if type(v) == "string" then
+		local hex = string.gsub(v, "^#", "")
+		if string.match(hex, "^%x%x%x%x%x%x$") then
+			local r = tonumber(string.sub(hex, 1, 2), 16)
+			local g = tonumber(string.sub(hex, 3, 4), 16)
+			local b = tonumber(string.sub(hex, 5, 6), 16)
+			return Color3.fromRGB(r, g, b)
+		end
+		local bc = BrickColor.new(v)
+		if bc then
+			return bc.Color
+		end
+		error('cor invalida: "' .. v .. '"; use "#ff8800" ou o nome de um BrickColor', 0)
+	end
+	local n = numeros(v)
+	if n then
+		if (n[1] or 0) > 1 or (n[2] or 0) > 1 or (n[3] or 0) > 1 then
+			return Color3.fromRGB(n[1] or 0, n[2] or 0, n[3] or 0)
+		end
+		return Color3.new(n[1] or 0, n[2] or 0, n[3] or 0)
+	end
+	error("nao consegui ler a cor: use \"#ff8800\", [255,136,0] ou [1,0.5,0]", 0)
+end
+
+local function paraUDim(v)
+	if typeof(v) == "UDim" then
+		return v
+	end
+	if type(v) == "number" then
+		return UDim.new(0, v)
+	end
+	if type(v) == "table" then
+		if v.scale ~= nil or v.offset ~= nil or v.Scale ~= nil or v.Offset ~= nil then
+			return UDim.new(tonumber(v.scale or v.Scale) or 0, tonumber(v.offset or v.Offset) or 0)
+		end
+		local n = numeros(v)
+		if n then
+			return UDim.new(n[1] or 0, n[2] or 0)
+		end
+	end
+	error("formato de UDim invalido; use {scale=0.5, offset=10} ou [0.5,10]", 0)
+end
+
+local function paraUDim2(v)
+	if typeof(v) == "UDim2" then
+		return v
+	end
+	if type(v) == "table" then
+		if v.x ~= nil and v.y ~= nil and type(v.x) == "table" then
+			return UDim2.new(paraUDim(v.x), paraUDim(v.y))
+		end
+		if v.X ~= nil and v.Y ~= nil and type(v.X) == "table" then
+			return UDim2.new(paraUDim(v.X), paraUDim(v.Y))
+		end
+		local n = numeros(v)
+		if n and #n >= 4 then
+			return UDim2.new(n[1], n[2], n[3], n[4])
+		end
+	end
+	error("formato de UDim2 invalido; use [0.5,0,0,40] ou {x={scale=0.5,offset=0},y={scale=0,offset=40}}", 0)
+end
+
+local function paraCFrame(v)
+	if typeof(v) == "CFrame" then
+		return v
+	end
+	if type(v) == "table" then
+		local pos = v.position or v.Position or v.pos
+		local ori = v.orientation or v.Orientation or v.rotation or v.Rotation
+		if pos ~= nil then
+			local p = numeros(pos) or { 0, 0, 0 }
+			local base = CFrame.new(p[1] or 0, p[2] or 0, p[3] or 0)
+			if ori ~= nil then
+				local o = numeros(ori) or { 0, 0, 0 }
+				base = base * CFrame.fromOrientation(math.rad(o[1] or 0), math.rad(o[2] or 0), math.rad(o[3] or 0))
+			end
+			return base
+		end
+		local n = numeros(v)
+		if n and #n >= 3 then
+			local base = CFrame.new(n[1], n[2], n[3])
+			if #n >= 6 then
+				base = base * CFrame.fromOrientation(math.rad(n[4]), math.rad(n[5]), math.rad(n[6]))
+			end
+			return base
+		end
+	end
+	error("formato de CFrame invalido; use {position=[0,5,0], orientation=[0,90,0]}", 0)
+end
+
+local function paraEnum(tipo, v)
+	if typeof(v) == "EnumItem" then
+		return v
+	end
+	local itens = tipo:GetEnumItems()
+	if type(v) == "number" then
+		for _, item in ipairs(itens) do
+			if item.Value == v then
+				return item
+			end
+		end
+	end
+	local txt = tostring(v)
+	txt = string.match(txt, "([^%.]+)$") or txt
+	for _, item in ipairs(itens) do
+		if string.lower(item.Name) == string.lower(txt) then
+			return item
+		end
+	end
+	local nomes = {}
+	for i, item in ipairs(itens) do
+		if i <= 40 then
+			table.insert(nomes, item.Name)
+		end
+	end
+	error('valor invalido "' .. txt .. '" para ' .. tostring(tipo) .. '; validos: ' .. table.concat(nomes, ", "), 0)
+end
+
+local function converter(atual, v)
+	local t = typeof(atual)
+	if t == "number" then
+		local n = tonumber(v)
+		if n == nil then
+			error("esperava um numero, recebi " .. typeof(v), 0)
+		end
+		return n
+	end
+	if t == "string" then
+		return tostring(v)
+	end
+	if t == "boolean" then
+		if type(v) == "boolean" then
+			return v
+		end
+		local txt = string.lower(tostring(v))
+		return txt == "true" or txt == "1" or txt == "yes" or txt == "sim"
+	end
+	if t == "Vector3" then
+		if typeof(v) == "Vector3" then
+			return v
+		end
+		local n = numeros(v)
+		if n then
+			return Vector3.new(n[1] or 0, n[2] or 0, n[3] or 0)
+		end
+		error("esperava Vector3: {x,y,z} ou [x,y,z]", 0)
+	end
+	if t == "Vector2" then
+		if typeof(v) == "Vector2" then
+			return v
+		end
+		local n = numeros(v)
+		if n then
+			return Vector2.new(n[1] or 0, n[2] or 0)
+		end
+		error("esperava Vector2: {x,y} ou [x,y]", 0)
+	end
+	if t == "Color3" then
+		return paraCor(v)
+	end
+	if t == "BrickColor" then
+		if typeof(v) == "BrickColor" then
+			return v
+		end
+		local bc = BrickColor.new(tostring(v))
+		if bc == nil then
+			error('BrickColor invalido: "' .. tostring(v) .. '"', 0)
+		end
+		return bc
+	end
+	if t == "CFrame" then
+		return paraCFrame(v)
+	end
+	if t == "UDim" then
+		return paraUDim(v)
+	end
+	if t == "UDim2" then
+		return paraUDim2(v)
+	end
+	if t == "NumberRange" then
+		local n = numeros(v)
+		if type(v) == "table" and (v.min ~= nil or v.max ~= nil) then
+			return NumberRange.new(tonumber(v.min) or 0, tonumber(v.max) or tonumber(v.min) or 0)
+		end
+		if type(v) == "number" then
+			return NumberRange.new(v, v)
+		end
+		if n and #n >= 2 then
+			return NumberRange.new(n[1], n[2])
+		end
+		error("esperava NumberRange: {min,max}", 0)
+	end
+	if t == "EnumItem" then
+		return paraEnum(atual.EnumType, v)
+	end
+	if t == "Instance" then
+		if v == nil then
+			return nil
+		end
+		return resolver(v)
+	end
+	if t == "nil" then
+		if type(v) == "table" then
+			local n = numeros(v)
+			if n and #n == 3 then
+				return Vector3.new(n[1], n[2], n[3])
+			end
+			if n and #n == 2 then
+				return Vector2.new(n[1], n[2])
+			end
+		end
+		return v
+	end
+	return v
+end
+
+local function comHistorico(nome,fn)
+ local ctx=contextoAtual
+ local rec=nil
+ local okRec,value=pcall(function()return ChangeHistoryService:TryBeginRecording(nome,nome)end)
+ if okRec then rec=value end
+ if rec and ctx then ctx.recordings[rec]=true end
+ local ok,result=pcall(fn)
+ if rec then
+  local ended,err=pcall(function()ChangeHistoryService:FinishRecording(rec,ok and Enum.FinishRecordingOperation.Commit or Enum.FinishRecordingOperation.Cancel)end)
+  if ended and ctx then ctx.recordings[rec]=nil end
+  if not ended then error('Falha ao encerrar historico: '..tostring(err),0)end
+ end
+ if not ok then error(result,0)end
+ return result
+end
+
+local PROPS = {
+	{ "Instance", { "Name", "ClassName", "Archivable" } },
+	{ "BasePart", { "Position", "Size", "Orientation", "Anchored", "CanCollide", "CanTouch", "CanQuery", "Massless", "Color", "Material", "Transparency", "Reflectance", "CastShadow", "CollisionGroup" } },
+	{ "Part", { "Shape" } },
+	{ "MeshPart", { "MeshId", "TextureID", "DoubleSided" } },
+	{ "SpecialMesh", { "MeshId", "TextureId", "Scale", "MeshType" } },
+	{ "Model", { "PrimaryPart", "WorldPivot" } },
+	{ "LuaSourceContainer", { "Enabled", "RunContext" } },
+	{ "Light", { "Brightness", "Color", "Enabled", "Shadows", "Range", "Angle" } },
+	{ "Sound", { "SoundId", "Volume", "Looped", "Playing", "PlaybackSpeed", "TimePosition", "RollOffMaxDistance" } },
+	{ "Decal", { "Texture", "Color3", "Transparency", "Face" } },
+	{ "GuiObject", { "Position", "Size", "AnchorPoint", "BackgroundColor3", "BackgroundTransparency", "BorderSizePixel", "Visible", "ZIndex", "Rotation", "ClipsDescendants" } },
+	{ "TextLabel", { "Text", "TextColor3", "TextSize", "TextScaled", "TextWrapped", "TextXAlignment", "TextYAlignment", "RichText" } },
+	{ "TextButton", { "Text", "TextColor3", "TextSize", "TextScaled", "AutoButtonColor" } },
+	{ "TextBox", { "Text", "PlaceholderText", "TextColor3", "TextSize", "ClearTextOnFocus" } },
+	{ "ImageLabel", { "Image", "ImageColor3", "ImageTransparency", "ScaleType" } },
+	{ "ImageButton", { "Image", "ImageColor3", "ImageTransparency", "ScaleType" } },
+	{ "ScrollingFrame", { "CanvasSize", "ScrollBarThickness", "AutomaticCanvasSize" } },
+	{ "UIListLayout", { "FillDirection", "Padding", "SortOrder", "HorizontalAlignment", "VerticalAlignment" } },
+	{ "UIPadding", { "PaddingTop", "PaddingBottom", "PaddingLeft", "PaddingRight" } },
+	{ "UICorner", { "CornerRadius" } },
+	{ "LayerCollector", { "Enabled", "ResetOnSpawn", "ZIndexBehavior" } },
+	{ "BillboardGui", { "Adornee", "Size", "AlwaysOnTop", "StudsOffset", "MaxDistance" } },
+	{ "SurfaceGui", { "Adornee", "Face", "AlwaysOnTop", "PixelsPerStud" } },
+	{ "Attachment", { "Position", "Orientation", "Visible" } },
+	{ "Constraint", { "Attachment0", "Attachment1", "Enabled" } },
+	{ "Humanoid", { "Health", "MaxHealth", "WalkSpeed", "JumpPower", "JumpHeight", "HipHeight" } },
+	{ "Camera", { "CFrame", "FieldOfView", "CameraType" } },
+	{ "Lighting", { "Ambient", "Brightness", "ClockTime", "GeographicLatitude", "OutdoorAmbient", "FogEnd", "FogStart", "FogColor", "EnvironmentDiffuseScale", "ExposureCompensation" } },
+	{ "Workspace", { "Gravity", "StreamingEnabled", "FallenPartsDestroyHeight" } },
+	{ "ParticleEmitter", { "Rate", "Lifetime", "Speed", "Enabled", "Texture", "Color", "Size", "Transparency", "SpreadAngle" } },
+	{ "Beam", { "Attachment0", "Attachment1", "Color", "Width0", "Width1", "Enabled", "Texture" } },
+	{ "ProximityPrompt", { "ActionText", "ObjectText", "HoldDuration", "MaxActivationDistance", "Enabled" } },
+	{ "Tool", { "RequiresHandle", "CanBeDropped", "Grip", "ToolTip" } },
+	{ "Team", { "TeamColor", "AutoAssignable" } },
+	{ "ValueBase", { "Value" } },
+}
+
+local function propsPara(inst)
+	local lista = {}
+	local vistos = {}
+	for _, par in ipairs(PROPS) do
+		local ok, isa = pcall(function()
+			return inst:IsA(par[1])
+		end)
+		if ok and isa then
+			for _, nome in ipairs(par[2]) do
+				if not vistos[nome] then
+					vistos[nome] = true
+					table.insert(lista, nome)
+				end
+			end
+		end
+	end
+	return lista
+end
+
+local function lerPropriedades(inst, nomes)
+	local saida = {}
+	for _, nome in ipairs(nomes) do
+		local ok, valor = pcall(function()
+			if nome == "Source" and inst:IsA("LuaSourceContainer") then return ScriptEditorService:GetEditorSource(inst) end
+			return inst[nome]
+		end)
+		if ok then
+			local cod = codificar(valor)
+			if cod ~= nil then
+				saida[nome] = cod
+			end
+		end
+	end
+	return saida
+end
+
+local function resumo(inst)
+	return { id = idDe(inst), name = inst.Name, className = inst.ClassName, path = caminhoDe(inst) }
+end
+
+local function fonteDe(scr)
+	local ok, txt = pcall(function()
+		return ScriptEditorService:GetEditorSource(scr)
+	end)
+	if ok and type(txt) == "string" then
+		return txt
+	end
+	local ok2, txt2 = pcall(function()
+		return scr.Source
+	end)
+	if ok2 and type(txt2) == "string" then
+		return txt2
+	end
+	error("nao consegui ler o codigo deste script", 0)
+end
+
+local function ehFonte(inst)
+	local ok, isa = pcall(function()
+		return inst:IsA("LuaSourceContainer")
+	end)
+	return ok and isa == true
+end
+
+local varredura = {
+	internos = { CoreGui = true, CorePackages = true, RobloxPluginGuiService = true, PluginGuiService = true, PluginDebugService = true, StudioService = true, CoreScriptSyncService = true, RobloxReplicatedStorage = true, StudioData = true, GuiRoot = true, PluginPolicyService = true, ScriptEditorService = true },
+	indice = nil, pronto = false, vivo = false, construtor = nil,
+	lower = {}, bytesCache = 0, TETO_CACHE = 32 * 1024 * 1024, TETO_SCRIPT = 256 * 1024,
+}
+
+function varredura.raizes(raiz)
+	if raiz ~= game then return { raiz } end
+	local out = {}
+	for _, svc in ipairs(game:GetChildren()) do
+		if not varredura.internos[svc.ClassName] then table.insert(out, svc) end
+	end
+	return out
+end
+
+function varredura.cada(raiz, orcamento, fn)
+	for _, r in ipairs(varredura.raizes(raiz)) do
+		if raiz == game and fn(r) then return true end
+		local okFilhos, filhos = pcall(r.GetChildren, r)
+		for _, filho in ipairs(okFilhos and filhos or {}) do
+			respirar(orcamento)
+			if fn(filho) then return true end
+			local ok, lista = pcall(filho.GetDescendants, filho)
+			if ok then
+				for _, inst in ipairs(lista) do
+					respirar(orcamento)
+					if fn(inst) then return true end
+				end
+			end
+		end
+	end
+	return false
+end
+function varredura.dentroDoProjeto(inst)
+	local topo = inst
+	while topo.Parent ~= nil and topo.Parent ~= game do topo = topo.Parent end
+	return topo.Parent == game and not varredura.internos[topo.ClassName]
+end
+function varredura.esquecer(inst)
+	if varredura.indice ~= nil then varredura.indice[inst] = nil end
+	local c = varredura.lower[inst]
+	if c ~= nil then
+		varredura.bytesCache = varredura.bytesCache - 2 * #c.fonte
+		varredura.lower[inst] = nil
+	end
+end
+
+varredura.vivo = pcall(function()
+	game.DescendantAdded:Connect(function(inst)
+		if varredura.indice ~= nil and ehFonte(inst) and varredura.dentroDoProjeto(inst) then varredura.indice[inst] = true end
+	end)
+	game.DescendantRemoving:Connect(varredura.esquecer)
+end)
+
+function varredura.scripts()
+	if varredura.pronto and varredura.vivo then return varredura.indice end
+	if varredura.construtor == nil or coroutine.status(varredura.construtor) == "dead" then
+		varredura.pronto = false
+		local idx = {}
+		varredura.indice = idx
+		varredura.construtor = task.spawn(function()
+			local ok = pcall(varredura.cada, game, novoOrcamento(), function(inst)
+				if ehFonte(inst) then idx[inst] = true end
+			end)
+			if ok and varredura.indice == idx then varredura.pronto = true end
+		end)
+	end
+	while not varredura.pronto and coroutine.status(varredura.construtor) ~= "dead" do
+		task.wait()
+	end
+	if not varredura.pronto then error("nao consegui indexar os scripts do place", 0) end
+	return varredura.indice
+end
+
+function varredura.candidatos(raiz, orcamento, filtroNome)
+	local function passaNome(inst)
+		return filtroNome == nil or string.find(string.lower(inst.Name), filtroNome, 1, true) ~= nil
+	end
+	if ehFonte(raiz) then
+		return passaNome(raiz) and { raiz } or {}, 1
+	end
+	local lista, chaves, total = {}, {}, 0
+	local function aceitar(inst)
+		total = total + 1
+		if passaNome(inst) then
+			table.insert(lista, inst)
+			chaves[inst] = inst:GetFullName()
+		end
+	end
+	if raiz ~= game and not varredura.dentroDoProjeto(raiz) then
+
+		varredura.cada(raiz, orcamento, function(inst)
+			if ehFonte(inst) then aceitar(inst) end
+		end)
+	else
+
+		local todos = {}
+		for inst in pairs(varredura.scripts()) do todos[#todos + 1] = inst end
+		for _, inst in ipairs(todos) do
+			respirar(orcamento)
+			if not inst:IsDescendantOf(game) then
+				varredura.esquecer(inst)
+			elseif raiz == game or inst:IsDescendantOf(raiz) then
+				aceitar(inst)
+			end
+		end
+	end
+	table.sort(lista, function(x, y) return chaves[x] < chaves[y] end)
+	return lista, total
+end
+
+function varredura.minusculas(inst, fonte)
+	local c = varredura.lower[inst]
+	if c ~= nil then
+		if c.fonte == fonte then return c.lower end
+		varredura.bytesCache = varredura.bytesCache - 2 * #c.fonte
+		varredura.lower[inst] = nil
+	end
+	local l = string.lower(fonte)
+	if varredura.vivo and #fonte <= varredura.TETO_SCRIPT and varredura.bytesCache + 2 * #fonte <= varredura.TETO_CACHE then
+		varredura.lower[inst] = { fonte = fonte, lower = l }
+		varredura.bytesCache = varredura.bytesCache + 2 * #fonte
+	end
+	return l
+end
+
+local function gravarFonte(scr,novo,base)
+ base=base or fonteDe(scr)
+ local ctx=contextoAtual
+ local conflict=false
+ local ok,err=pcall(function()
+  ScriptEditorService:UpdateSourceAsync(scr,function(current)
+   if (ctx and (ctx.cancelled or ctx.done)) or current~=base then conflict=true;return nil end
+   return novo
+  end)
+ end)
+ if conflict then error({code='STALE_REVISION',message='O editor mudou durante a gravacao; releia. Nenhum fallback Source foi usado.',nothingExecuted=false},0)end
+ if ok then return true end
+ if ctx and (ctx.cancelled or ctx.done)then error('Gravacao cancelada',0)end
+
+ if fonteDe(scr)~=base or scr.Source~=base then error('Editor/Source divergiu. Releia com get_script antes de editar.',0)end
+ local saved,failed=pcall(function()scr.Source=novo end)
+ if not saved then error('Falha ao gravar codigo: '..tostring(failed or err),0)end
+ return true
+end
+
+local acoes = {}
+
+acoes.get_tree = function(a)
+	local raiz = a.target ~= nil and resolver(a.target) or game
+	local prof = math.clamp(math.floor(tonumber(a.depth) or 2), 1, 10)
+	local teto = math.clamp(math.floor(tonumber(a.limit) or 250), 1, 2000)
+	local filtro = {}
+	local temFiltro = false
+	if type(a.classes) == "table" then
+		for _, c in ipairs(a.classes) do
+			filtro[string.lower(tostring(c))] = true
+			temFiltro = true
+		end
+	end
+	local total = 0
+	local cortado = false
+	local orcamento = novoOrcamento()
+	local function montar(inst, nivel)
+		if total >= teto then
+			cortado = true
+			return nil
+		end
+		respirar(orcamento)
+		local no = resumo(inst)
+		local filhos = inst:GetChildren()
+		no.childCount = #filhos
+		local lista = nil
+		if nivel < prof then
+			for _, f in ipairs(filhos) do
+				local sub = montar(f, nivel + 1)
+				if sub ~= nil then
+					lista = lista or {}
+					table.insert(lista, sub)
+				end
+				if total >= teto then
+					cortado = true
+					break
+				end
+			end
+		elseif #filhos > 0 then
+			no.hasMore = true
+		end
+		no.children = lista
+		if temFiltro and not filtro[string.lower(inst.ClassName)] and lista == nil then
+			return nil
+		end
+		total = total + 1
+		return no
+	end
+	local arvore = montar(raiz, 0)
+	return { tree = arvore, nodes = total, truncated = cortado, depth = prof }
+end
+
+acoes.find_instances = function(a)
+	local raiz = a.target ~= nil and resolver(a.target) or game
+	local teto = math.clamp(math.floor(tonumber(a.limit) or 50), 1, 500)
+	local modo = tostring(a.mode or "contains")
+	local alvoNome = a.query ~= nil and tostring(a.query) or nil
+	local classe = a.className ~= nil and tostring(a.className) or nil
+	if alvoNome == nil and classe == nil then
+		error("informe query e/ou className", 0)
+	end
+	local alvoMinusculo = alvoNome ~= nil and string.lower(alvoNome) or nil
+	local function combinaNome(nome)
+		if alvoNome == nil then
+			return true
+		end
+		if modo == "exact" then
+			return nome == alvoNome
+		end
+		if modo == "pattern" then
+			local ok, res = pcall(string.match, nome, alvoNome)
+			return ok and res ~= nil
+		end
+		return string.find(string.lower(nome), alvoMinusculo, 1, true) ~= nil
+	end
+	local function combinaClasse(inst)
+		if classe == nil then
+			return true
+		end
+		local ok, isa = pcall(inst.IsA, inst, classe)
+		return (ok and isa == true) or inst.ClassName == classe
+	end
+	local achados = {}
+	local vistos = 0
+	local cortado = false
+	local orcamento = novoOrcamento()
+	local inicio = os.clock()
+	local function visitar(inst)
+		vistos = vistos + 1
+		if combinaClasse(inst) and combinaNome(inst.Name) then
+			table.insert(achados, resumo(inst))
+			if #achados >= teto then
+				cortado = true
+				return true
+			end
+		end
+		return false
+	end
+	local CLASSES_SCRIPT = { Script = true, LocalScript = true, ModuleScript = true, LuaSourceContainer = true, BaseScript = true }
+	if classe ~= nil and CLASSES_SCRIPT[classe] then
+
+		for _, inst in ipairs((varredura.candidatos(raiz, orcamento))) do
+			if visitar(inst) then break end
+		end
+	else
+		varredura.cada(raiz, orcamento, visitar)
+	end
+	return { results = achados, count = #achados, scanned = vistos, truncated = cortado, ms = math.floor((os.clock() - inicio) * 1000) }
+end
+
+acoes.get_instance = function(a)
+	local inst = resolver(a.target)
+	local nomes = nil
+	if type(a.properties) == "table" and #a.properties > 0 then
+		nomes = {}
+		for _, n in ipairs(a.properties) do
+			table.insert(nomes, tostring(n))
+		end
+	else
+		nomes = propsPara(inst)
+	end
+	local saida = resumo(inst)
+	saida.parent = caminhoDe(inst.Parent)
+	saida.properties = lerPropriedades(inst, nomes)
+	local okAttr, attrs = pcall(function()
+		return inst:GetAttributes()
+	end)
+	if okAttr and attrs ~= nil then
+		saida.attributes = codificar(attrs)
+	end
+	local okTags, tags = pcall(function()
+		return CollectionService:GetTags(inst)
+	end)
+	if okTags and tags ~= nil and #tags > 0 then
+		saida.tags = tags
+	end
+	if a.includeChildren ~= false then
+		local filhos = {}
+		for i, f in ipairs(inst:GetChildren()) do
+			if i <= 200 then
+				table.insert(filhos, resumo(f))
+			end
+		end
+		saida.children = filhos
+		saida.childCount = #inst:GetChildren()
+	end
+	local okScript = pcall(function()
+		return inst:IsA("LuaSourceContainer")
+	end)
+	if okScript and inst:IsA("LuaSourceContainer") then
+		local ok, fonte = pcall(fonteDe, inst)
+		if ok then
+			local _, linhas = string.gsub(fonte, "\n", "")
+			saida.script = { lines = linhas + 1, chars = #fonte, hint = "use get_script para ler o codigo" }
+		end
+	end
+	return saida
+end
+
+local function aplicarPropriedades(inst,props,attrs)
+ local aplicadas,falhas={},{}
+
+ if type(props)=='table' and props.Source~=nil and inst:IsA('LuaSourceContainer')then
+  gravarFonte(inst,props.Source);table.insert(aplicadas,'Source')
+  local copy={};for k,v in pairs(props)do if k~='Source'then copy[k]=v end end;props=copy
+ end
+	if type(props) == "table" then
+		for nome, valor in pairs(props) do
+			local chaveProp = tostring(nome)
+			local okLer, atual = pcall(function()
+				return inst[chaveProp]
+			end)
+			local ok, erro = pcall(function()
+				local convertido = converter(okLer and atual or nil, valor)
+				inst[chaveProp] = convertido
+			end)
+			if ok then
+				table.insert(aplicadas, chaveProp)
+			else
+				table.insert(falhas, { property = chaveProp, error = tostring(erro) })
+			end
+		end
+	end
+	if type(attrs) == "table" then
+		for nome, valor in pairs(attrs) do
+			local ok, erro = pcall(function()
+				inst:SetAttribute(tostring(nome), valor)
+			end)
+			if ok then
+				table.insert(aplicadas, "@" .. tostring(nome))
+			else
+				table.insert(falhas, { attribute = tostring(nome), error = tostring(erro) })
+			end
+		end
+	end
+	return aplicadas, falhas
+end
+
+acoes.create_instance = function(a)
+	local classe = tostring(a.className or "")
+	if classe == "" then
+		error("informe className", 0)
+	end
+	local pai = a.parent ~= nil and resolver(a.parent) or game:GetService("Workspace")
+	return comHistorico("MCP criar " .. classe, function()
+		local okNovo, inst = pcall(function()
+			return Instance.new(classe)
+		end)
+		if not okNovo then
+			error('nao consigo criar "' .. classe .. '": classe invalida ou nao criavel por script (' .. tostring(inst) .. ')', 0)
+		end
+		if a.name ~= nil then
+			inst.Name = tostring(a.name)
+		end
+		local aplicadas, falhas = aplicarPropriedades(inst, a.properties, nil)
+		inst.Parent = pai
+		if a.select == true then
+			Selection:Set({ inst })
+		end
+		local saida = resumo(inst)
+		saida.applied = aplicadas
+		if #falhas > 0 then
+			saida.failed = falhas
+		end
+		return saida
+	end)
+end
+
+acoes.set_properties = function(a)
+	local inst = resolver(a.target)
+	return comHistorico("MCP alterar " .. inst.Name, function()
+		local aplicadas, falhas = aplicarPropriedades(inst, a.properties, a.attributes)
+		if #aplicadas == 0 and #falhas > 0 then
+			error("nenhuma propriedade foi aplicada: " .. HttpService:JSONEncode(falhas), 0)
+		end
+		local saida = resumo(inst)
+		saida.applied = aplicadas
+		if #falhas > 0 then
+			saida.failed = falhas
+		end
+		return saida
+	end)
+end
+
+acoes.delete_instance = function(a)
+	local alvos = a.targets
+	if type(alvos) ~= "table" or #alvos == 0 then
+		error("informe targets: uma lista de caminhos ou ids", 0)
+	end
+	return comHistorico("MCP apagar", function()
+		local apagados = {}
+		local orcamento = novoOrcamento()
+		for _, ref in ipairs(alvos) do
+			local inst = resolver(ref)
+			if inst == game then
+				error("nao vou apagar o game", 0)
+			end
+			table.insert(apagados, caminhoDe(inst))
+			inst:Destroy()
+			respirar(orcamento)
+		end
+		return { deleted = apagados, count = #apagados }
+	end)
+end
+
+acoes.move_instance = function(a)
+	local inst = resolver(a.target)
+	local pai = resolver(a.parent)
+	return comHistorico("MCP mover " .. inst.Name, function()
+		inst.Parent = pai
+		return resumo(inst)
+	end)
+end
+
+acoes.duplicate_instance = function(a)
+	local inst = resolver(a.target)
+	local quantos = math.clamp(math.floor(tonumber(a.count) or 1), 1, 100)
+	local pai = a.parent ~= nil and resolver(a.parent) or inst.Parent
+	return comHistorico("MCP duplicar " .. inst.Name, function()
+		local criados = {}
+		local orcamento = novoOrcamento()
+		for i = 1, quantos do
+			local copia = inst:Clone()
+			if a.name ~= nil then
+				copia.Name = quantos == 1 and tostring(a.name) or (tostring(a.name) .. i)
+			end
+			copia.Parent = pai
+			table.insert(criados, resumo(copia))
+			respirar(orcamento)
+		end
+		return { created = criados, count = #criados }
+	end)
+end
+
+acoes.get_script = function(a)
+	local inst = resolver(a.target)
+	if not inst:IsA("LuaSourceContainer") then
+		error(caminhoDe(inst) .. " nao e um script (e " .. inst.ClassName .. ")", 0)
+	end
+	local fonte = fonteDe(inst)
+	local revision = controle:read(contextoAtual.agent,inst,fonte)
+	local linhas = string.split(fonte, "\n")
+	local ini = math.max(1, math.floor(tonumber(a.lineStart) or 1))
+	local fim = math.min(#linhas, math.floor(tonumber(a.lineEnd) or #linhas))
+	local pedaco = {}
+	for i = ini, fim do
+		table.insert(pedaco, linhas[i])
+	end
+	return {
+		path = caminhoDe(inst),
+		id = idDe(inst),
+		className = inst.ClassName,
+		lines = #linhas,
+		revision = revision,
+		lineStart = ini,
+		lineEnd = fim,
+		source = table.concat(pedaco, "\n"),
+	}
+end
+
+acoes.grep_scripts = function(a)
+	local raiz = a.target ~= nil and resolver(a.target) or game
+	local padrao = tostring(a.pattern or "")
+	if padrao == "" then
+		error("informe pattern", 0)
+	end
+	local regex = a.regex == true
+	local sensivel = a.caseSensitive == true
+	local ctxLinhas = math.clamp(math.floor(tonumber(a.context) or 0), 0, 5)
+	local teto = math.clamp(math.floor(tonumber(a.limit) or 100), 1, 1000)
+	local maxPorScript = math.clamp(math.floor(tonumber(a.maxPerScript) or 25), 1, 200)
+	local filtroNome = a.scriptName ~= nil and string.lower(tostring(a.scriptName)) or nil
+	local agulha = sensivel and padrao or string.lower(padrao)
+	if regex then
+		local ok, err = pcall(string.find, "", agulha)
+		if not ok then
+			error("pattern invalido: " .. tostring(err), 0)
+		end
+	end
+
+	local function casa(alvo)
+		if regex then
+			local ok, s = pcall(string.find, alvo, agulha)
+			return ok and s ~= nil
+		end
+		return string.find(alvo, agulha, 1, true) ~= nil
+	end
+
+	local prefiltro = not regex or string.find(padrao, "[%^%$]") == nil
+	local inicio = os.clock()
+	local orcamento = novoOrcamento()
+
+	local lista, indexados = varredura.candidatos(raiz, orcamento, filtroNome)
+	local porScript = {}
+	local scripts, comMatch, total, cortado = 0, 0, 0, false
+	for _, inst in ipairs(lista) do
+		respirar(orcamento)
+		if total >= teto then
+			cortado = true
+			break
+		end
+		do
+			scripts = scripts + 1
+			local ok, fonte = pcall(fonteDe, inst)
+			local texto = ok and (sensivel and fonte or varredura.minusculas(inst, fonte)) or nil
+			if ok and (not prefiltro or casa(texto)) then
+				local linhas = string.split(fonte, "\n")
+				local alvos = sensivel and linhas or string.split(texto, "\n")
+				local aqui = 0
+				local entrada = nil
+				for i = 1, #linhas do
+					if i % 64 == 0 then
+						respirar(orcamento)
+					end
+					if casa(alvos[i]) then
+						local linha = linhas[i]
+						if entrada == nil then
+							entrada = { path = caminhoDe(inst), id = idDe(inst), className = inst.ClassName, lines = #linhas, matches = {} }
+							comMatch = comMatch + 1
+							table.insert(porScript, entrada)
+						end
+						aqui = aqui + 1
+						total = total + 1
+						local m = { line = i, text = string.sub(linha, 1, 300) }
+						if ctxLinhas > 0 then
+							local antes, depois = {}, {}
+							for j = math.max(1, i - ctxLinhas), i - 1 do
+								table.insert(antes, string.sub(linhas[j], 1, 300))
+							end
+							for j = i + 1, math.min(#linhas, i + ctxLinhas) do
+								table.insert(depois, string.sub(linhas[j], 1, 300))
+							end
+							m.before = antes
+							m.after = depois
+						end
+						table.insert(entrada.matches, m)
+						if aqui >= maxPorScript then
+							entrada.truncated = true
+							break
+						end
+						if total >= teto then
+							cortado = true
+							break
+						end
+					end
+				end
+			end
+		end
+	end
+	return { pattern = padrao, regex = regex, scripts = scripts, indexedScripts = indexados, matchedScripts = comMatch, count = total, truncated = cortado, results = porScript, ms = math.floor((os.clock() - inicio) * 1000) }
+end
+
+local OUTLINE_PADROES = {
+	{ "^(%s*)local%s+function%s+([%w_%.:]+)%s*%(([^)]*)%)", "local function" },
+	{ "^(%s*)function%s+([%w_%.:]+)%s*%(([^)]*)%)", "function" },
+	{ "^(%s*)local%s+([%w_]+)%s*=%s*function%s*%(([^)]*)%)", "local function" },
+	{ "^(%s*)([%w_%.:%[%]\"']+)%s*=%s*function%s*%(([^)]*)%)", "function" },
+}
+
+acoes.outline_script = function(a)
+	local inst = resolver(a.target)
+	if not inst:IsA("LuaSourceContainer") then
+		error(caminhoDe(inst) .. " nao e um script (e " .. inst.ClassName .. ")", 0)
+	end
+	local fonte = fonteDe(inst)
+	local linhas = string.split(fonte, "\n")
+	local itens, requires, services = {}, {}, {}
+	local orcamento = novoOrcamento()
+	local incluirLocais = a.locals ~= false
+	for i, linha in ipairs(linhas) do
+		if i % 64 == 0 then
+			respirar(orcamento)
+		end
+		local achou = false
+		for _, p in ipairs(OUTLINE_PADROES) do
+			local indent, nome, params = string.match(linha, p[1])
+			if nome ~= nil then
+				table.insert(itens, { kind = p[2], name = nome, params = (string.gsub(params or "", "%s+", " ")), line = i, indent = #indent })
+				achou = true
+				break
+			end
+		end
+		if not achou then
+			local indent, nomes, modulo = string.match(linha, "^(%s*)local%s+([%w_,%s]-)%s*=%s*require%s*%(?%s*(.-)%s*%)?%s*$")
+			if nomes ~= nil and modulo ~= nil and modulo ~= "" then
+				local nomeLimpo = (string.gsub(nomes, "%s+", ""))
+				table.insert(requires, { name = nomeLimpo, module = modulo, line = i })
+				table.insert(itens, { kind = "require", name = nomeLimpo, params = modulo, line = i, indent = #indent })
+				achou = true
+			end
+		end
+		if not achou then
+			local nome, servico = string.match(linha, "^%s*local%s+([%w_]+)%s*=%s*game:GetService%(%s*[\"']([%w_]+)[\"']%s*%)")
+			if nome ~= nil then
+				table.insert(services, { name = nome, service = servico, line = i })
+				achou = true
+			end
+		end
+		if not achou and incluirLocais then
+			local nomes = string.match(linha, "^local%s+([%w_,%s]-)%s*=")
+			if nomes ~= nil and not string.find(linha, "function", 1, true) then
+				table.insert(itens, { kind = "local", name = (string.gsub(nomes, "%s+", "")), line = i, indent = 0 })
+				achou = true
+			end
+		end
+		if not achou then
+			local ret = string.match(linha, "^return%s+(.+)$")
+			if ret ~= nil then
+				table.insert(itens, { kind = "return", name = string.sub(ret, 1, 120), line = i, indent = 0 })
+			end
+		end
+	end
+	return { path = caminhoDe(inst), id = idDe(inst), className = inst.ClassName, lines = #linhas, chars = #fonte, functions = itens, requires = requires, services = services }
+end
+
+acoes.set_script = function(a)
+	local inst = resolver(a.target)
+	if not inst:IsA("LuaSourceContainer") then
+		error(caminhoDe(inst) .. " nao e um script (e " .. inst.ClassName .. ")", 0)
+	end
+	local atual = fonteDe(inst)
+	local novo = nil
+	local trocas = 0
+	if type(a.edits) == "table" and #a.edits > 0 then
+		novo = atual
+		for i, ed in ipairs(a.edits) do
+			local procura = tostring(ed.find or "")
+			local troca = tostring(ed.replace or "")
+			if procura == "" then
+				error("edit " .. i .. ": find vazio", 0)
+			end
+			local quantas = 0
+			local pos = 1
+			while true do
+				local s = string.find(novo, procura, pos, true)
+				if s == nil then
+					break
+				end
+				quantas = quantas + 1
+				pos = s + #procura
+			end
+			if quantas == 0 then
+				error("edit " .. i .. ': nao achei o trecho "' .. string.sub(procura, 1, 80) .. '" no script; leia com get_script antes de editar', 0)
+			end
+			if quantas > 1 and ed.all ~= true then
+				error("edit " .. i .. ": o trecho aparece " .. quantas .. " vezes; use um trecho maior ou all=true", 0)
+			end
+			local inicio = string.find(novo, procura, 1, true)
+			if ed.all == true then
+				local partes = string.split(novo, procura)
+				novo = table.concat(partes, troca)
+				trocas = trocas + quantas
+			else
+				novo = string.sub(novo, 1, inicio - 1) .. troca .. string.sub(novo, inicio + #procura)
+				trocas = trocas + 1
+			end
+		end
+	elseif a.source ~= nil then
+		novo = tostring(a.source)
+	else
+		error("informe source (codigo completo) ou edits (lista de trocas)", 0)
+	end
+	return comHistorico("MCP escrever " .. inst.Name, function()
+		gravarFonte(inst, novo, atual)
+		local _, linhas = string.gsub(novo, "\n", "")
+		return { path = caminhoDe(inst), id = idDe(inst), lines = linhas + 1, chars = #novo, edits = trocas }
+	end)
+end
+
+acoes.create_script = function(a)
+	local tipo = tostring(a.kind or "Script")
+	if tipo ~= "Script" and tipo ~= "LocalScript" and tipo ~= "ModuleScript" then
+		error("kind deve ser Script, LocalScript ou ModuleScript", 0)
+	end
+	local pai = a.parent ~= nil and resolver(a.parent) or game:GetService("ServerScriptService")
+	return comHistorico("MCP criar " .. tipo, function()
+		local scr = Instance.new(tipo)
+		scr.Name = tostring(a.name or tipo)
+		if a.runContext ~= nil and tipo == "Script" then
+			pcall(function()
+				scr.RunContext = paraEnum(Enum.RunContext, a.runContext)
+			end)
+		end
+		scr.Parent = pai
+		if a.source ~= nil then
+			gravarFonte(scr, tostring(a.source))
+		end
+		return resumo(scr)
+	end)
+end
+
+local quadroCompartilhado={exceeded=quadroEstourado,yield=cederQuadro}
+local executarLuau=criarRunLuau({task=task,clock=os.clock,compile=loadstring,setEnvironment=setfenv,environment=getfenv(),log=LogService.MessageOut,encode=codificar,history=comHistorico,require=require,source=fonteDe,path=caminhoDe,freshDefault=true,frame=quadroCompartilhado})
+acoes.run_luau=function(a)return executarLuau(a,contextoAtual)end
+
+acoes.get_selection = function()
+	local itens = {}
+	for _, inst in ipairs(Selection:Get()) do
+		table.insert(itens, resumo(inst))
+	end
+	return { selection = itens, count = #itens }
+end
+
+acoes.set_selection = function(a)
+	if type(a.targets) ~= "table" then
+		error("informe targets: uma lista de caminhos ou ids", 0)
+	end
+	local itens = {}
+	for _, ref in ipairs(a.targets) do
+		table.insert(itens, resolver(ref))
+	end
+	Selection:Set(itens)
+	return { selected = #itens }
+end
+
+local TIPOS_ASSET = { [1] = "decal", [13] = "decal", [3] = "audio", [4] = "mesh", [40] = "mesh", [62] = "video", [10] = "model" }
+acoes.insert_asset = function(a)
+	local id = math.floor(tonumber(a.assetId) or 0)
+	if id <= 0 then
+		error("informe assetId (numero)", 0)
+	end
+	local pai = a.parent ~= nil and resolver(a.parent) or game:GetService("Workspace")
+	local tipo = string.lower(tostring(a.kind or "auto"))
+	local uri = "rbxassetid://" .. id
+	local tipoId = nil
+	if tipo == "auto" or tipo == "image" then
+		local okInfo, info = pcall(function()
+			return MarketplaceService:GetProductInfo(id)
+		end)
+		if okInfo and type(info) == "table" then
+			tipoId = tonumber(info.AssetTypeId)
+		end
+		if tipo == "auto" then
+			tipo = TIPOS_ASSET[tipoId] or "model"
+		else
+			tipo = "decal"
+		end
+	end
+	return comHistorico("MCP inserir asset " .. id, function()
+		local criados = {}
+		local function colocar(inst)
+			if a.name ~= nil then
+				inst.Name = tostring(a.name)
+			end
+			inst.Parent = pai
+			table.insert(criados, inst)
+		end
+		if tipo == "audio" then
+			local som = Instance.new("Sound")
+			som.SoundId = uri
+			som.Name = "Sound_" .. id
+			colocar(som)
+		elseif tipo == "decal" then
+			local como = tostring(a.as or "")
+			if como == "" then
+				if pai:IsA("BasePart") then
+					como = "Decal"
+				elseif pai:IsA("GuiBase2d") or pai:IsA("LayerCollector") then
+					como = "ImageLabel"
+				else
+					error("para imagem/decal o parent precisa ser um BasePart (vira Decal/Texture) ou uma Gui (vira ImageLabel/ImageButton); ou informe as=Decal|Texture|ImageLabel|ImageButton", 0)
+				end
+			end
+			if como ~= "Decal" and como ~= "Texture" and como ~= "ImageLabel" and como ~= "ImageButton" then
+				error("as invalido para imagem: use Decal, Texture, ImageLabel ou ImageButton", 0)
+			end
+			local inst = Instance.new(como)
+			if como == "Decal" or como == "Texture" then
+				inst.Texture = uri
+			else
+				inst.Image = uri
+				inst.BackgroundTransparency = 1
+				inst.Size = UDim2.fromOffset(200, 200)
+			end
+			colocar(inst)
+		elseif tipo == "video" then
+			local video = Instance.new("VideoFrame")
+			video.Video = uri
+			video.Size = UDim2.fromOffset(320, 180)
+			colocar(video)
+		elseif tipo == "mesh" then
+			local okM, malha = pcall(function()
+				return InsertService:CreateMeshPartAsync(Content.fromUri(uri), { CollisionFidelity = Enum.CollisionFidelity.Default, RenderFidelity = Enum.RenderFidelity.Automatic })
+			end)
+			if not okM or malha == nil then
+				okM, malha = pcall(function()
+					return InsertService:CreateMeshPartAsync(uri, Enum.CollisionFidelity.Default, Enum.RenderFidelity.Automatic)
+				end)
+			end
+			if not okM or malha == nil then
+				error("nao consegui criar MeshPart do mesh " .. id .. ": " .. tostring(malha), 0)
+			end
+			malha.Anchored = true
+			if malha.Name == "" or malha.Name == "MeshPart" then
+				malha.Name = "Mesh_" .. id
+			end
+			colocar(malha)
+		else
+			local ok, pacote = pcall(function()
+				return InsertService:LoadAsset(id)
+			end)
+			if not ok then
+				error("nao consegui carregar o asset " .. id .. ": " .. tostring(pacote) .. " (o asset precisa ser seu, publico ou gratis na Toolbox; para audio/decal/mesh informe kind)", 0)
+			end
+			for _, filho in ipairs(pacote:GetChildren()) do
+				colocar(filho)
+			end
+			pacote:Destroy()
+		end
+		if type(a.position) == "table" then
+			local p = Vector3.new(tonumber(a.position[1]) or 0, tonumber(a.position[2]) or 0, tonumber(a.position[3]) or 0)
+			for _, inst in ipairs(criados) do
+				if inst:IsA("PVInstance") then
+					local atual = inst:GetPivot()
+					inst:PivotTo(CFrame.new(p) * atual.Rotation)
+				end
+			end
+		end
+		local scripts, removidos, pecas = {}, 0, 0
+		local orcamento = novoOrcamento()
+		for _, inst in ipairs(criados) do
+			local lista = inst:GetDescendants()
+			table.insert(lista, 1, inst)
+			for _, d in ipairs(lista) do
+				respirar(orcamento)
+				if d:IsA("LuaSourceContainer") then
+					if a.removeScripts == true then
+						d:Destroy()
+						removidos = removidos + 1
+					elseif #scripts < 60 then
+						table.insert(scripts, caminhoDe(d) .. " [" .. d.ClassName .. "]")
+					end
+				elseif d:IsA("BasePart") then
+					pecas = pecas + 1
+				end
+			end
+		end
+		local saida = {}
+		for _, inst in ipairs(criados) do
+			local item = resumo(inst)
+			if inst:IsA("PVInstance") then
+				local okB, cf, tam = pcall(function()
+					if inst:IsA("Model") then
+						return inst:GetBoundingBox()
+					end
+					return inst.CFrame, inst.Size
+				end)
+				if okB then
+					item.position = { math.floor(cf.Position.X * 100 + 0.5) / 100, math.floor(cf.Position.Y * 100 + 0.5) / 100, math.floor(cf.Position.Z * 100 + 0.5) / 100 }
+					item.size = { math.floor(tam.X * 100 + 0.5) / 100, math.floor(tam.Y * 100 + 0.5) / 100, math.floor(tam.Z * 100 + 0.5) / 100 }
+				end
+			end
+			table.insert(saida, item)
+		end
+		if a.select == true then
+			pcall(function()
+				Selection:Set(criados)
+			end)
+		end
+		return { inserted = saida, count = #saida, assetId = id, assetType = tipo, assetTypeId = tipoId, parts = pecas, scripts = scripts, scriptsRemoved = removidos }
+	end)
+end
+
+acoes.get_logs = function(a)
+	local teto = math.clamp(math.floor(tonumber(a.limit) or 60), 1, 500)
+	local nivel = string.lower(tostring(a.level or "all"))
+	local contem = a.contains ~= nil and string.lower(tostring(a.contains)) or nil
+	local ok, historico = pcall(function()
+		return LogService:GetLogHistory()
+	end)
+	if not ok then
+		error("nao consegui ler a saida do Studio: " .. tostring(historico), 0)
+	end
+	local mapa = {
+		[Enum.MessageType.MessageOutput] = "output",
+		[Enum.MessageType.MessageInfo] = "info",
+		[Enum.MessageType.MessageWarning] = "warning",
+		[Enum.MessageType.MessageError] = "error",
+	}
+	local filtradas = {}
+	local orcamento = novoOrcamento()
+	for _, linha in ipairs(historico) do
+		respirar(orcamento)
+		local tipo = mapa[linha.messageType] or "output"
+		local passa = nivel == "all" or nivel == tipo
+		if passa and contem ~= nil then
+			passa = string.find(string.lower(tostring(linha.message)), contem, 1, true) ~= nil
+		end
+		if passa then
+			table.insert(filtradas, { message = linha.message, level = tipo, at = linha.timestamp })
+		end
+	end
+	local saida = {}
+	local ini = math.max(1, #filtradas - teto + 1)
+	for i = ini, #filtradas do
+		table.insert(saida, filtradas[i])
+	end
+	return { logs = saida, count = #saida, total = #filtradas }
+end
+
+acoes.undo_history = function(a)
+	local acao = string.lower(tostring(a.action or "undo"))
+	local passos = math.clamp(math.floor(tonumber(a.steps) or 1), 1, 25)
+	local feitos = 0
+	for _ = 1, passos do
+		local ok = pcall(function()
+			if acao == "redo" then
+				ChangeHistoryService:Redo()
+			else
+				ChangeHistoryService:Undo()
+			end
+		end)
+		if not ok then
+			break
+		end
+		feitos = feitos + 1
+	end
+	return { action = acao, steps = feitos, requested = passos }
+end
+
+local function falharControle(code,message,extra)
+ local e=extra or {};e.code=code;e.message=message;e.nothingExecuted=true;error(e,0)
+end
+local function resolverLista(refs)local out={};for _,ref in ipairs(refs or {})do table.insert(out,resolver(ref))end;return out end
+local function prepararControle(ev)
+ local a,tool,plans=ev.args or {},ev.tool,{}
+ local function add(target,kind,recursive,keep)if target then table.insert(plans,{target=target,kind=kind,recursive=recursive==true,keepRead=keep==true})end end
+ if a.target~=nil then a.target=resolver(a.target)end
+ if a.parent~=nil then a.parent=resolver(a.parent)end
+ if a.targets~=nil then a.targets=resolverLista(a.targets)end
+ if tool=='get_tree' or tool=='find_instances' or tool=='grep_scripts' then add(a.target or game,'read',true)
+ elseif tool=='inspect_model' then
+
+  if not a.target then falharControle('TARGET_REQUIRED','Informe target (Model, BasePart ou pasta).')end;add(a.target,'read',true)
+ elseif tool=='export_file' then
+
+  if a.target~=nil then
+   local scr=a.target:IsA('LuaSourceContainer') and (a.kind==nil or a.kind=='auto' or a.kind=='script')
+   add(a.target,'read',not scr,scr)
+  end
+ elseif tool=='outline_script' then add(a.target,'read',false)
+ elseif tool=='get_instance' or tool=='get_script' then add(a.target,'read',false,true)
+ elseif tool=='set_script' then
+  if not a.target or not a.target:IsA('LuaSourceContainer')then falharControle('NOT_SCRIPT','O alvo nao e script.')end;add(a.target,'write')
+ elseif tool=='set_properties' then
+  local props=a.properties or {};add(a.target,'write',props.Name~=nil or props.Parent~=nil)
+  if props.Parent~=nil then
+   props.Parent=resolver(props.Parent)
+   if props.Parent==a.target or props.Parent:IsDescendantOf(a.target)then falharControle('PARENT_CYCLE','Novo pai criaria ciclo.')end
+   add(a.target.Parent,'write');add(props.Parent,'write')
+  end
+  if props.Source~=nil and type(props.Source)~='string'then falharControle('INVALID_SOURCE','Source deve ser texto.')end
+ elseif tool=='create_instance' or tool=='create_script' or tool=='insert_asset' then
+  a.parent=a.parent or game:GetService(tool=='create_script' and 'ServerScriptService' or 'Workspace');add(a.parent,'write')
+  if a.properties and a.properties.Parent~=nil then falharControle('USE_PARENT_ARGUMENT','Use parent, nao properties.Parent, em create_instance.')end
+ elseif tool=='delete_instance' then
+  if not a.targets or #a.targets==0 then falharControle('TARGET_REQUIRED','Informe targets.')end
+  for _,target in ipairs(a.targets)do
+   if target==game then falharControle('PROTECTED_ROOT','Nao e permitido apagar game.')end
+   add(target,'write',true);add(target.Parent,'write')
+  end
+ elseif tool=='move_instance' then
+  if a.parent==a.target or a.parent:IsDescendantOf(a.target)then falharControle('PARENT_CYCLE','Movimento criaria ciclo.')end
+  add(a.target,'write',true);add(a.target.Parent,'write');add(a.parent,'write')
+ elseif tool=='duplicate_instance' then
+  a.parent=a.parent or a.target.Parent;add(a.target,'read',true);add(a.parent,'write')
+ elseif tool=='run_luau' then
+
+ elseif tool=='import_asset' then
+
+  if a.target~=nil then add(a.target,'write')
+  else
+   if a.parent==nil then
+    local as=tostring(a.as or '')
+    if as=='ImageLabel' or as=='ImageButton' then a.parent=game:GetService('StarterGui')
+    elseif as=='Decal' or as=='Texture' then falharControle('PARENT_REQUIRED','Decal/Texture precisam de parent (um BasePart).')
+    else a.parent=game:GetService('Workspace')end
+   end
+   add(a.parent,'write')
+  end
+ elseif tool=='import_manage' then
+  if a.action=='restore' or a.action=='remove' then
+   if not a.target then falharControle('TARGET_REQUIRED','Informe target para '..tostring(a.action)..'.')end
+   add(a.target,'write',true);if a.action=='remove' then add(a.target.Parent,'write')end
+  elseif a.action=='restoreAll' then add(game,'write',true)
+  end
+ elseif tool=='livesession_status' or tool=='livesession_journal' or tool=='livesession_verify' or tool=='livesession_control' then
+
+ elseif tool=='import_upload' or tool=='import_status' then
+
+ elseif tool=='undo_history' then add(game,'write',true)
+ elseif tool=='get_selection' then for _,target in ipairs(Selection:Get())do add(target,'read')end
+ elseif tool=='set_selection' or tool=='get_logs' or tool=='file_lock' or tool=='file_unlock' or tool=='file_locks' or tool=='agent_close' or tool=='studio_play' then
+
+ else falharControle('UNCLASSIFIED_TOOL','Ferramenta sem politica de controle: recusada.')end
+ ev.args=a;return plans
+end
+local function verificarVersoes(ev)
+ local a,tool=ev.args,ev.tool
+ if tool=='set_script' or (tool=='set_properties' and a.properties and a.properties.Source~=nil)then
+  controle:checkVersion(ev.agent,a.target,fonteDe(a.target),a.expectedRevision,true)
+ elseif tool=='delete_instance' then for _,target in ipairs(a.targets)do controle:checkObserved(ev.agent,fonteDe,target)end
+ elseif tool=='set_properties' or tool=='move_instance' then controle:checkObserved(ev.agent,fonteDe,a.target)
+ elseif tool=='undo_history' then controle:checkObserved(ev.agent,fonteDe,nil)end
+end
+local function registrarVersoes(ev,result)
+ local a,tool=ev.args,ev.tool
+ if tool=='get_script'then return
+ elseif tool=='get_instance' and a.target:IsA('LuaSourceContainer') and result.properties.Source~=nil then result.revision=controle:read(ev.agent,a.target,result.properties.Source)
+ elseif tool=='set_script' or (tool=='set_properties' and a.properties and a.properties.Source~=nil)then result.revision=controle:read(ev.agent,a.target,fonteDe(a.target))
+ elseif tool=='create_script' or (tool=='create_instance' and result.id and resolver(result.id):IsA('LuaSourceContainer'))then
+  local target=resolver(result.id);result.revision=controle:read(ev.agent,target,fonteDe(target))
+ end
+end
+
+local LIMITE_VIGIA=200
+local function ehScript(inst)local ok,isa=pcall(function()return inst:IsA('LuaSourceContainer')end);return ok and isa==true end
+local function vigiarRunLuau(ev)
+ if ev.tool~='run_luau' then return nil end
+ local antes,total={},0
+ local function fotografar(inst)
+  if total>=LIMITE_VIGIA or antes[inst]~=nil or not ehScript(inst)then return end
+  local ok,src=pcall(fonteDe,inst);if ok then antes[inst]=src;total=total+1 end
+ end
+ for _,entry in ipairs(controle:foreign(ev.agent))do
+  fotografar(entry.target)
+  if entry.recursive and total<LIMITE_VIGIA then
+   local ok,desc=pcall(function()return entry.target:GetDescendants()end)
+   if ok then for _,inst in ipairs(desc)do if total>=LIMITE_VIGIA then break end;fotografar(inst)end end
+  end
+ end
+ if total==0 then return nil end
+ return function(result)
+  local tocados={}
+  for inst,src in pairs(antes)do
+   if not vivo(inst)then table.insert(tocados,{target=idDe(inst),path=caminhoDe(inst),destroyed=true})
+   else local ok,agora=pcall(fonteDe,inst);if ok and agora~=src then table.insert(tocados,{target=idDe(inst),path=caminhoDe(inst)})end end
+  end
+  if #tocados==0 or type(result)~='table' then return end
+  result.touchedLockedScripts=tocados
+  result.warnings=result.warnings or {}
+  table.insert(result.warnings,'run_luau alterou/destruiu '..#tocados..' script(s) que outro agente esta lendo ou editando. Para editar codigo de forma coordenada use set_script; run_luau e para validar.')
+  controle:log('run_luau-touched',ev.agent,{count=#tocados,first=tocados[1]})
+ end
+end
+acoes.file_lock=function(a)
+ local plans={};for _,target in ipairs(a.targets or {})do table.insert(plans,{target=target,kind=a.kind or 'write',recursive=a.recursive~=false})end
+ return controle:reserve(contextoAtual.agent,plans,a.seconds,a.note)
+end
+acoes.file_unlock=function(a)return controle:release(contextoAtual.agent,a.targets or {},a.all==true)end
+acoes.file_locks=function(a)return controle:list(contextoAtual.agent,a.mine==true,a.offset,a.limit)end
+acoes.agent_close=function()return controle:close(contextoAtual.agent)end
+
+
+do
+
+local AssetService = game:GetService("AssetService")
+
+local function r2(n) n = tonumber(n) or 0; if n ~= n or n == math.huge or n == -math.huge then return 0 end; return math.floor(n * 100 + 0.5) / 100 end
+local function r1(n) n = tonumber(n) or 0; return math.floor(n * 10 + 0.5) / 10 end
+local function v3(v) return { r2(v.X), r2(v.Y), r2(v.Z) } end
+local function angulos(cf) local rx, ry, rz = cf:ToOrientation(); return { r1(math.deg(rx)), r1(math.deg(ry)), r1(math.deg(rz)) } end
+local function ehParte(inst) local ok, isa = pcall(function() return inst:IsA("BasePart") end); return ok and isa == true end
+local function ehPV(inst) local ok, isa = pcall(function() return inst:IsA("PVInstance") end); return ok and isa == true end
+
+local function aabbDe(cf, size)
+	local hx, hy, hz = size.X / 2, size.Y / 2, size.Z / 2
+	local xv, yv, zv = cf.XVector, cf.YVector, cf.ZVector
+	local ex = math.abs(xv.X) * hx + math.abs(yv.X) * hy + math.abs(zv.X) * hz
+	local ey = math.abs(xv.Y) * hx + math.abs(yv.Y) * hy + math.abs(zv.Y) * hz
+	local ez = math.abs(xv.Z) * hx + math.abs(yv.Z) * hy + math.abs(zv.Z) * hz
+	local p = cf.Position
+	return Vector3.new(p.X - ex, p.Y - ey, p.Z - ez), Vector3.new(p.X + ex, p.Y + ey, p.Z + ez)
+end
+
+local function formaDe(part)
+	if part:IsA("MeshPart") then return "Mesh" end
+	if part:IsA("UnionOperation") then return "Union" end
+	if part:IsA("WedgePart") then return "Wedge" end
+	if part:IsA("CornerWedgePart") then return "CornerWedge" end
+	if part:IsA("TrussPart") then return "Truss" end
+	if part:IsA("Part") then
+		local ok, s = pcall(function() return part.Shape.Name end)
+		if ok then return s end
+	end
+	return part.ClassName
+end
+
+local function lerMesh(part, maxVerts, maxFaces, orcamento)
+	local info = { part = part.Name, id = idDe(part) }
+	local meshId, escala, malha, fonte = nil, Vector3.new(1, 1, 1), nil, nil
+	if part:IsA("MeshPart") then
+		meshId = part.MeshId
+		local okC, conteudo = pcall(function() return part.MeshContent end)
+		if okC and conteudo ~= nil then
+			local okO, obj = pcall(function() return conteudo.SourceType == Enum.ContentSourceType.Object and conteudo.Object or nil end)
+			if okO and obj ~= nil then malha = obj; fonte = "EditableMesh (objeto da propria peca)" end
+		end
+		local okS, ms = pcall(function() return part.MeshSize end)
+		if okS and ms and ms.X > 0 and ms.Y > 0 and ms.Z > 0 then escala = Vector3.new(part.Size.X / ms.X, part.Size.Y / ms.Y, part.Size.Z / ms.Z) end
+	else
+		local sm = part:FindFirstChildWhichIsA("SpecialMesh")
+		if sm and sm.MeshType == Enum.MeshType.FileMesh then meshId = sm.MeshId; escala = sm.Scale end
+	end
+	info.meshId = meshId ~= nil and meshId ~= "" and meshId or nil
+	if info.meshId then
+		local okT, tid = pcall(function() return part.TextureID end)
+		if okT and tid ~= nil and tid ~= "" then info.textureId = tid end
+	end
+	local criado = false
+	if malha == nil and info.meshId then
+		local ok, em = pcall(function() return AssetService:CreateEditableMeshAsync(Content.fromUri(info.meshId)) end)
+		if not ok or em == nil then
+			local ok2, em2 = pcall(function() return AssetService:CreateEditableMeshAsync(info.meshId) end)
+			if ok2 and em2 ~= nil then ok, em = true, em2 end
+		end
+		if ok and em ~= nil then malha = em; criado = true; fonte = "EditableMesh (asset)"
+		else info.unavailable = "EditableMesh indisponivel: " .. tostring(em):sub(1, 140) .. " (mesh de terceiro ou sem permissao; use bounds/size)" end
+	elseif malha == nil then
+		info.unavailable = part:IsA("UnionOperation") and "Union nao expoe geometria" or "sem MeshId"
+	end
+	if malha == nil then return info, nil end
+	local okV, ids = pcall(function() return malha:GetVertices() end)
+	local okF, fids = pcall(function() return malha:GetFaces() end)
+	if not okV or type(ids) ~= "table" then
+		info.unavailable = "EditableMesh sem vertices legiveis"
+		if criado then pcall(function() malha:Destroy() end) end
+		return info, nil
+	end
+	info.source = fonte
+	info.vertices = #ids
+	info.faces = okF and type(fids) == "table" and #fids or nil
+	local minX, minY, minZ, maxX, maxY, maxZ = math.huge, math.huge, math.huge, -math.huge, -math.huge, -math.huge
+	local sx, sy, sz = 0, 0, 0
+	local locais = {}
+	local indice = {}
+	for i, vid in ipairs(ids) do
+		respirar(orcamento)
+		local okP, p = pcall(function() return malha:GetPosition(vid) end)
+		if okP and p ~= nil then
+			local x, y, z = p.X * escala.X, p.Y * escala.Y, p.Z * escala.Z
+			if x < minX then minX = x end; if y < minY then minY = y end; if z < minZ then minZ = z end
+			if x > maxX then maxX = x end; if y > maxY then maxY = y end; if z > maxZ then maxZ = z end
+			sx = sx + x; sy = sy + y; sz = sz + z
+			locais[i] = Vector3.new(x, y, z)
+			indice[vid] = i - 1
+		end
+	end
+	local n = #locais
+	if n > 0 then
+		info.bounds = { min = { r2(minX), r2(minY), r2(minZ) }, max = { r2(maxX), r2(maxY), r2(maxZ) }, size = { r2(maxX - minX), r2(maxY - minY), r2(maxZ - minZ) } }
+		info.centroid = { r2(sx / n), r2(sy / n), r2(sz / n) }
+	end
+	if maxVerts > 0 and n > 0 then
+		local amostra = {}
+		for i = 1, math.min(maxVerts, n) do amostra[i] = v3(locais[i]) end
+		info.vertexSample = amostra
+		info.vertexSampleNote = n > maxVerts and ("primeiros " .. maxVerts .. " de " .. n .. " vertices, espaco da peca (studs, origem no centro)") or ("todos os " .. n .. " vertices, espaco da peca (studs, origem no centro)")
+	end
+	if maxFaces > 0 and okF and type(fids) == "table" then
+		local tri, lidas = {}, 0
+		local teto = maxVerts > 0 and math.min(maxVerts, n) or n
+		for _, fid in ipairs(fids) do
+			respirar(orcamento)
+			lidas = lidas + 1
+			local okFV, vs = pcall(function() return malha:GetFaceVertices(fid) end)
+			if okFV and type(vs) == "table" then
+				local a, b, c = indice[vs[1]], indice[vs[2]], indice[vs[3]]
+				if a ~= nil and b ~= nil and c ~= nil and a < teto and b < teto and c < teto then
+					table.insert(tri, { a, b, c })
+					if #tri >= maxFaces then break end
+				end
+			end
+			if lidas >= 60000 then break end
+		end
+		info.faceSample = tri
+		info.faceSampleNote = "indices em vertexSample (0-based)" .. (#tri < (info.faces or 0) and (", " .. #tri .. " de " .. tostring(info.faces)) or "")
+	end
+	return info, { malha = malha, criado = criado, locais = locais, escala = escala }
+end
+
+local VISTAS = {
+	{ nome = "topo", desc = "de cima (-Y): col->+X lin->+Z; digito = altura Y", col = "X", lin = "Z", prof = "Y", sinal = 1 },
+	{ nome = "frente", desc = "de +Z olhando -Z: col->+X lin->-Y; digito = proximidade em Z", col = "X", lin = "Y", prof = "Z", sinal = 1, invLin = true },
+	{ nome = "lado", desc = "de -X olhando +X: col->+Z lin->-Y; digito = proximidade em -X", col = "Z", lin = "Y", prof = "X", sinal = -1, invLin = true },
+}
+local function comp(v, eixo) if eixo == "X" then return v.X elseif eixo == "Y" then return v.Y end; return v.Z end
+local function vetorEixo(eixo, s) if eixo == "X" then return Vector3.new(s, 0, 0) elseif eixo == "Y" then return Vector3.new(0, s, 0) end; return Vector3.new(0, 0, s) end
+
+local function projetar(caixas, nuvens, minG, maxG, resolucao, orcamento)
+	local tam = maxG - minG
+	local maior = math.max(tam.X, tam.Y, tam.Z, 0.01)
+	local celula = maior / resolucao
+	local saida = { cell = r2(celula), views = {} }
+	for _, vista in ipairs(VISTAS) do
+		local cols = math.max(1, math.min(resolucao, math.ceil(comp(tam, vista.col) / celula)))
+		local lins = math.max(1, math.min(resolucao, math.ceil(comp(tam, vista.lin) / celula)))
+		local grade = {}
+		for l = 1, lins do grade[l] = {} end
+		local profMin, profMax = math.huge, -math.huge
+		local function pintar(cx, cy, profundidade)
+			local c = math.floor((cx - comp(minG, vista.col)) / celula) + 1
+			local l = math.floor((cy - comp(minG, vista.lin)) / celula) + 1
+			if c < 1 then c = 1 elseif c > cols then c = cols end
+			if l < 1 then l = 1 elseif l > lins then l = lins end
+			if vista.invLin then l = lins - l + 1 end
+			local atual = grade[l][c]
+			if atual == nil or profundidade > atual then grade[l][c] = profundidade end
+			if profundidade < profMin then profMin = profundidade end
+			if profundidade > profMax then profMax = profundidade end
+		end
+
+		for _, nuvem in ipairs(nuvens) do
+			local cf = nuvem.cf
+			for _, p in ipairs(nuvem.pontos) do
+				respirar(orcamento)
+				local w = cf:PointToWorldSpace(p)
+				pintar(comp(w, vista.col), comp(w, vista.lin), comp(w, vista.prof) * vista.sinal)
+			end
+		end
+
+		if #caixas > 0 then
+			local dir = vetorEixo(vista.prof, -vista.sinal)
+			local longe = comp(vista.sinal > 0 and maxG or minG, vista.prof) + vista.sinal * (maior + 1)
+			for l = 1, lins do
+				for c = 1, cols do
+					respirar(orcamento)
+					local lr = vista.invLin and (lins - l + 1) or l
+					local cx = comp(minG, vista.col) + (c - 0.5) * celula
+					local cy = comp(minG, vista.lin) + (lr - 0.5) * celula
+					local origem
+					if vista.prof == "Y" then origem = Vector3.new(cx, longe, cy)
+					elseif vista.prof == "Z" then origem = Vector3.new(cx, cy, longe)
+					else origem = Vector3.new(longe, cy, cx) end
+					local melhor = nil
+					for _, cx3 in ipairs(caixas) do
+						local o = cx3.cf:PointToObjectSpace(origem)
+						local d = cx3.cf:VectorToObjectSpace(dir)
+						local h = cx3.half
+						local tmin, tmax, ok = -math.huge, math.huge, true
+						for eixo = 1, 3 do
+							local oe = eixo == 1 and o.X or eixo == 2 and o.Y or o.Z
+							local de = eixo == 1 and d.X or eixo == 2 and d.Y or d.Z
+							local he = eixo == 1 and h.X or eixo == 2 and h.Y or h.Z
+							if math.abs(de) < 1e-9 then
+								if math.abs(oe) > he then ok = false; break end
+							else
+								local t1, t2 = (-he - oe) / de, (he - oe) / de
+								if t1 > t2 then t1, t2 = t2, t1 end
+								if t1 > tmin then tmin = t1 end
+								if t2 < tmax then tmax = t2 end
+								if tmin > tmax then ok = false; break end
+							end
+						end
+						if ok and tmax >= 0 then
+							local t = math.max(tmin, 0)
+							if melhor == nil or t < melhor then melhor = t end
+						end
+					end
+					if melhor ~= nil then
+						local hit = origem + dir * melhor
+						pintar(cx, cy, comp(hit, vista.prof) * vista.sinal)
+					end
+				end
+			end
+		end
+		local linhas = {}
+		local faixa = profMax - profMin
+		for l = 1, lins do
+			local buf = {}
+			for c = 1, cols do
+				local p = grade[l][c]
+				if p == nil then buf[c] = "."
+				elseif faixa < 1e-6 then buf[c] = "9"
+				else buf[c] = tostring(math.max(1, math.min(9, 1 + math.floor((p - profMin) / faixa * 8.999)))) end
+			end
+			linhas[l] = table.concat(buf)
+		end
+		table.insert(saida.views, {
+			name = vista.nome, desc = vista.desc, rows = linhas,
+			colAxis = vista.col, colRange = { r1(comp(minG, vista.col)), r1(comp(maxG, vista.col)) },
+			lineAxis = vista.lin, lineRange = { r1(comp(minG, vista.lin)), r1(comp(maxG, vista.lin)) },
+
+			depth = profMin ~= math.huge and { axis = vista.prof, far = r1(profMin * vista.sinal), near = r1(profMax * vista.sinal) } or nil,
+		})
+	end
+	return saida
+end
+
+acoes.inspect_model = function(a)
+	local alvo = resolver(a.target)
+	local detalhe = tostring(a.detail or "parts")
+	local maxParts = math.clamp(math.floor(tonumber(a.maxParts) or 150), 1, 1000)
+	local maxMeshes = math.clamp(math.floor(tonumber(a.maxMeshes) or 8), 0, 40)
+	local maxVerts = math.clamp(math.floor(tonumber(a.maxVertices) or 0), 0, 3000)
+	local maxFaces = math.clamp(math.floor(tonumber(a.maxFaces) or 0), 0, 3000)
+	local resolucao = math.clamp(math.floor(tonumber(a.resolution) or 24), 8, 48)
+	local querProj = a.projections ~= false
+	local espacoMundo = tostring(a.space or "local") == "world"
+	local orcamento = novoOrcamento()
+
+	local pecas = {}
+	if ehParte(alvo) then table.insert(pecas, alvo) end
+	for _, d in ipairs(alvo:GetDescendants()) do
+		respirar(orcamento)
+		if ehParte(d) then table.insert(pecas, d) end
+	end
+	local saida = resumo(alvo)
+	saida.parentPath = caminhoDe(alvo.Parent)
+	if #pecas == 0 then
+		saida.counts = { parts = 0 }
+		saida.note = "nenhuma BasePart dentro do alvo; nada para inspecionar geometricamente"
+		return saida
+	end
+
+	local pivo
+	if ehPV(alvo) then pivo = alvo:GetPivot() else pivo = nil end
+	local minG, maxG = nil, nil
+	local volumeDe = {}
+	for _, p in ipairs(pecas) do
+		local mn, mx = aabbDe(p.CFrame, p.Size)
+		if minG == nil then minG, maxG = mn, mx
+		else minG = Vector3.new(math.min(minG.X, mn.X), math.min(minG.Y, mn.Y), math.min(minG.Z, mn.Z)); maxG = Vector3.new(math.max(maxG.X, mx.X), math.max(maxG.Y, mx.Y), math.max(maxG.Z, mx.Z)) end
+		volumeDe[p] = p.Size.X * p.Size.Y * p.Size.Z
+	end
+	if pivo == nil then pivo = CFrame.new((minG + maxG) / 2) end
+	saida.pivot = { position = v3(pivo.Position), orientation = angulos(pivo) }
+	saida.bounds = { min = v3(minG), max = v3(maxG), size = v3(maxG - minG), center = v3((minG + maxG) / 2) }
+	if alvo:IsA("Model") then
+		local okB, bcf, bsz = pcall(function() return alvo:GetBoundingBox() end)
+		if okB then saida.orientedBounds = { position = v3(bcf.Position), orientation = angulos(bcf), size = v3(bsz) } end
+		if alvo.PrimaryPart then saida.primaryPart = alvo.PrimaryPart.Name end
+	end
+
+	local cont = { parts = #pecas, meshParts = 0, unions = 0, attachments = 0, joints = 0, constraints = 0, scripts = 0, decals = 0, lights = 0, sounds = 0, particles = 0, models = 0 }
+	local anexos, juntas, scripts, humanoide = {}, {}, {}, nil
+	local todos = alvo:GetDescendants()
+	for _, d in ipairs(todos) do
+		respirar(orcamento)
+		if d:IsA("MeshPart") then cont.meshParts = cont.meshParts + 1
+		elseif d:IsA("UnionOperation") then cont.unions = cont.unions + 1 end
+		if d:IsA("Attachment") then cont.attachments = cont.attachments + 1; if #anexos < 60 then table.insert(anexos, d) end
+		elseif d:IsA("JointInstance") then cont.joints = cont.joints + 1; if #juntas < 80 then table.insert(juntas, d) end
+		elseif d:IsA("Constraint") then cont.constraints = cont.constraints + 1
+		elseif d:IsA("LuaSourceContainer") then cont.scripts = cont.scripts + 1; if #scripts < 40 then table.insert(scripts, caminhoDe(d) .. " [" .. d.ClassName .. "]") end
+		elseif d:IsA("Decal") or d:IsA("Texture") then cont.decals = cont.decals + 1
+		elseif d:IsA("Light") then cont.lights = cont.lights + 1
+		elseif d:IsA("Sound") then cont.sounds = cont.sounds + 1
+		elseif d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail") then cont.particles = cont.particles + 1
+		elseif d:IsA("Model") then cont.models = cont.models + 1
+		elseif d:IsA("Humanoid") then humanoide = d end
+	end
+	saida.counts = cont
+	if humanoide then
+		local motores = {}
+		for _, j in ipairs(juntas) do if j:IsA("Motor6D") then table.insert(motores, j.Name) end end
+		local okR, rig = pcall(function() return humanoide.RigType.Name end)
+		saida.rig = { rigType = okR and rig or "?", motors = motores, health = humanoide.MaxHealth, hipHeight = r2(humanoide.HipHeight) }
+	end
+	if cont.scripts > 0 then saida.scripts = scripts end
+
+	table.sort(pecas, function(x, y) return volumeDe[x] > volumeDe[y] end)
+	local inv = pivo:Inverse()
+	local caixas, nuvens, meshes = {}, {}, {}
+	local meshCandidatos = {}
+	if detalhe ~= "summary" then
+		local lista = {}
+		for i, p in ipairs(pecas) do
+			respirar(orcamento)
+			if i > maxParts then saida.partsTruncated = #pecas - maxParts; break end
+			local rel = inv * p.CFrame
+			local cf = espacoMundo and p.CFrame or rel
+			local item = {
+				id = idDe(p), name = p.Name, className = p.ClassName, shape = formaDe(p),
+				pos = v3(cf.Position), rot = angulos(cf), size = v3(p.Size),
+				material = p.Material.Name, color = corHex(p.Color),
+			}
+			if p.Parent ~= alvo and p.Parent ~= nil then item.parent = p.Parent.Name end
+			if p.Transparency > 0 then item.transparency = r2(p.Transparency) end
+			if not p.Anchored then item.anchored = false end
+			if not p.CanCollide then item.canCollide = false end
+			if p:IsA("MeshPart") then
+				if p.MeshId ~= "" then item.meshId = p.MeshId end
+				if p.TextureID ~= "" then item.textureId = p.TextureID end
+			else
+				local sm = p:FindFirstChildWhichIsA("SpecialMesh")
+				if sm then item.specialMesh = sm.MeshType.Name; if sm.MeshId ~= "" then item.meshId = sm.MeshId end end
+			end
+			table.insert(lista, item)
+		end
+		saida.parts = lista
+		saida.space = espacoMundo and "world (posicoes absolutas)" or "local (pos/rot relativas ao pivo; mundo = pivo * local)"
+	end
+	for _, p in ipairs(pecas) do
+		if (p:IsA("MeshPart") and p.MeshId ~= "") or (p:IsA("Part") and p:FindFirstChildWhichIsA("SpecialMesh") ~= nil) then
+			if #meshCandidatos < maxMeshes then table.insert(meshCandidatos, p) end
+		end
+	end
+	local comNuvem = {}
+	if maxMeshes > 0 then
+		for _, p in ipairs(meshCandidatos) do
+			local info, dados = lerMesh(p, maxVerts, maxFaces, orcamento)
+			table.insert(meshes, info)
+			if dados ~= nil then
+				if querProj and #dados.locais > 0 then
+					local pontos = dados.locais
+					if #pontos > 20000 then
+						local passo, sub = math.ceil(#pontos / 20000), {}
+						for i = 1, #pontos, passo do sub[#sub + 1] = pontos[i] end
+						pontos = sub
+					end
+					table.insert(nuvens, { cf = p.CFrame, pontos = pontos })
+					comNuvem[p] = true
+				end
+				if dados.criado then pcall(function() dados.malha:Destroy() end) end
+			end
+		end
+		if #meshes > 0 then saida.meshes = meshes end
+		local totalMesh = 0
+		for _, p in ipairs(pecas) do if p:IsA("MeshPart") and p.MeshId ~= "" then totalMesh = totalMesh + 1 end end
+		if totalMesh > #meshCandidatos then saida.meshesTruncated = totalMesh - #meshCandidatos end
+	end
+	if querProj then
+		local limite = math.min(#pecas, 400)
+		for i = 1, limite do
+			local p = pecas[i]
+			if not comNuvem[p] then table.insert(caixas, { cf = p.CFrame, half = p.Size / 2 }) end
+		end
+		saida.projections = projetar(caixas, nuvens, minG, maxG, resolucao, orcamento)
+		if #pecas > limite then saida.projections.note = "projecao considerou as " .. limite .. " maiores pecas de " .. #pecas end
+	end
+	if detalhe == "full" then
+		if #anexos > 0 then
+			local lista = {}
+			for _, at in ipairs(anexos) do
+				local w = at.WorldCFrame
+				local cf = espacoMundo and w or (inv * w)
+				table.insert(lista, { name = at.Name, parent = at.Parent and at.Parent.Name or nil, pos = v3(cf.Position), rot = angulos(cf) })
+			end
+			saida.attachments = lista
+		end
+		if #juntas > 0 then
+			local lista = {}
+			for _, j in ipairs(juntas) do
+				table.insert(lista, { name = j.Name, className = j.ClassName, part0 = j.Part0 and j.Part0.Name or nil, part1 = j.Part1 and j.Part1.Name or nil })
+			end
+			saida.joints = lista
+		end
+	end
+	return saida
+end
+end
+
+
+do
+local RunService = game:GetService("RunService")
+local ServerStorage = game:GetService("ServerStorage")
+
+local function erroImport(code, message, nothingExecuted)
+	error({ code = code, message = message, nothingExecuted = nothingExecuted ~= false }, 0)
+end
+
+local function localizarApi()
+	local home = ServerStorage:FindFirstChild("ImportMCP")
+	local mod = home and home:FindFirstChild("MCP")
+	if not (mod and mod:IsA("ModuleScript")) then
+		local main = home and home:FindFirstChild("Main")
+		local modules = main and main:FindFirstChild("Modules")
+		mod = modules and modules:FindFirstChild("Api")
+	end
+	if not (mod and mod:IsA("ModuleScript")) then
+		erroImport("IMPORTMCP_MISSING", "ImportMCP nao esta neste place: falta ServerStorage.ImportMCP.MCP (ModuleScript). Insira a pasta ImportMCP no ServerStorage (ou peca ao usuario) e repita a chamada.")
+	end
+	return mod
+end
+
+local function importApi()
+	local mod = localizarApi()
+	local ok, api = pcall(require, mod)
+	if not ok or type(api) ~= "table" or type(api.execute) ~= "function" or type(api.status) ~= "function" then
+		erroImport("IMPORTMCP_INCOMPATIBLE", "ServerStorage.ImportMCP.MCP nao devolveu a Api 1.1+ (execute/status/upload). Atualize o ImportMCP. Detalhe: " .. tostring(ok and "modulo sem execute()" or api))
+	end
+	return api
+end
+
+local function exigirEditMode()
+	if RunService:IsRunning() then
+		erroImport("STUDIO_PLAYING", "Pare o play test (studio_play action=stop) antes de importar ou restaurar assets.")
+	end
+end
+
+local function desempacotar(result, code)
+	if type(result) == "table" and result.ok == false then
+		erroImport(code or "IMPORTMCP_ERROR", tostring(result.error or result.message or "falha no ImportMCP"), false)
+	end
+	return result
+end
+
+local function contarFontes(a)
+	local n = 0
+	for _, chave in ipairs({ "url", "data", "upload", "text" }) do
+		if a[chave] ~= nil and a[chave] ~= "" then n = n + 1 end
+	end
+	return n
+end
+
+local function montarRequisicao(a)
+	local target = {
+		parent = a.target == nil and a.parent or nil,
+		applyTo = a.target,
+		class = a.target == nil and a.as or nil,
+		property = a.property,
+		maxSize = a.maxSize,
+		properties = a.properties,
+	}
+	if a.rotation ~= nil then
+		target.cframe = { position = a.position or { 0, 0, 0 }, orientation = a.rotation }
+	else
+		target.position = a.position
+	end
+	local options = {
+		scale = a.scale,
+		center = a.center,
+		ground = a.ground,
+		collision = a.collision,
+		doubleSided = a.doubleSided,
+		anchored = a.anchored,
+		canCollide = a.canCollide,
+	}
+	return {
+		name = a.name,
+		fileName = a.fileName,
+		kind = a.kind ~= "auto" and a.kind or nil,
+		url = a.url,
+		data = a.data,
+		upload = a.upload,
+		text = a.text,
+		target = target,
+		options = options,
+		externals = a.externals,
+		persist = a.persist,
+	}
+end
+
+acoes.import_asset = function(a)
+	exigirEditMode()
+	local Api = importApi()
+	if contarFontes(a) ~= 1 then
+		erroImport("SOURCE_REQUIRED", "Informe exatamente UMA fonte: url=https://..., data=<base64>, upload=<id de import_upload> ou text=<JSON .gltf>.")
+	end
+	if a.target ~= nil and a.target:IsA("LuaSourceContainer") then
+		erroImport("NOT_IMAGE_TARGET", "target deve ser uma instancia que aceite imagem (ImageLabel, Decal, MeshPart...), nao um script.")
+	end
+	local ctx = contextoAtual
+	local function check()
+		if ctx and ctx.deadline and os.clock() >= ctx.deadline then
+			error({ code = "EXECUTION_TIMEOUT", message = "Prazo esgotado durante a importacao; arquivo grande demais para uma chamada. Reduza o arquivo ou use maxSize/scale menores." }, 0)
+		end
+		if ctx and ctx.cancelled then
+			error({ code = "CANCELLED", message = "Importacao cancelada." }, 0)
+		end
+	end
+	local request = montarRequisicao(a)
+	local rotulo = tostring(a.name or a.fileName or a.upload or (a.url and a.url:gsub("[?#].*$", ""):match("([^/]+)$")) or "asset")
+	local instance, report
+	comHistorico("MCP importar " .. rotulo, function()
+		instance, report = Api.execute(request, { source = "mcp", check = check })
+	end)
+	report = type(report) == "table" and report or {}
+	report.ok = true
+	report.instance = resumo(instance)
+	report.id = report.instance.id
+	report.path = report.instance.path
+	report.className = report.instance.className
+	if a.select ~= false then
+		pcall(function() Selection:Set({ instance }) end)
+	end
+	return report
+end
+
+acoes.import_upload = function(a)
+	local Api = importApi()
+	local action = a.action or "append"
+	if action == "begin" then
+		return desempacotar(Api.upload.begin(a.id, { name = a.name, expectedBytes = a.expectedBytes }))
+	end
+	if action == "list" then
+		return { uploads = Api.upload.list(a.state) }
+	end
+	if action == "clear" then
+		return desempacotar(Api.upload.clear(a.keepUnfinished ~= false))
+	end
+	if a.id == nil or a.id == "" then
+		erroImport("ID_REQUIRED", "Informe id (devolvido por action=begin).")
+	end
+	if action == "append" then
+		if type(a.chunk) ~= "string" or #a.chunk == 0 then
+			erroImport("CHUNK_REQUIRED", "Informe chunk (pedaco base64) em action=append.")
+		end
+		return desempacotar(Api.upload.append(a.id, a.chunk))
+	end
+	if action == "finish" then
+		return desempacotar(Api.upload.finish(a.id))
+	end
+	if action == "cancel" then
+		return desempacotar(Api.upload.cancel(a.id))
+	end
+	erroImport("INVALID_ACTION", "action deve ser begin, append, finish, cancel, list ou clear.")
+end
+
+acoes.import_status = function(a)
+	local Api = importApi()
+	if a.id ~= nil and a.id ~= "" then
+		return desempacotar(Api.result(a.id), "JOB_NOT_FOUND")
+	end
+	local status = desempacotar(Api.status())
+	status.api = Api.VERSION
+	if a.list == true then
+		status.assets = Api.list()
+	end
+	return status
+end
+
+acoes.import_manage = function(a)
+	local Api = importApi()
+	local action = a.action
+	if action == "install" then
+		return desempacotar(Api.install(a.force == true))
+	end
+	exigirEditMode()
+	if action == "restoreAll" then
+		return comHistorico("MCP ImportMCP restaurar tudo", function() return desempacotar(Api.restoreAll()) end)
+	end
+	if a.target == nil then
+		erroImport("TARGET_REQUIRED", "Informe target para " .. tostring(action) .. ".")
+	end
+	if action == "restore" then
+		return comHistorico("MCP ImportMCP restaurar " .. a.target.Name, function() return desempacotar(Api.restore(a.target)) end)
+	end
+	if action == "remove" then
+		return comHistorico("MCP ImportMCP remover " .. a.target.Name, function() return desempacotar(Api.remove(a.target, a.keepInstance == true)) end)
+	end
+	erroImport("INVALID_ACTION", "action deve ser restore, restoreAll, remove ou install.")
+end
+end
+
+
+do
+
+local function servicoLive(nome)
+	local ok, servico = pcall(function()
+		return game:GetService(nome)
+	end)
+	if ok then
+		return servico
+	end
+	return nil
+end
+local PONTE_LIVE = "LiveSessionBridge"
+local VIVOS_LIVE = { Running = true, Starting = true, Stopping = true }
+local ESPERA_LIVE = 2.5
+local ESCRITAS_LIVE = {
+	set_script = "script",
+	create_script = "script",
+	set_properties = "props",
+	create_instance = "create",
+	insert_asset = "create",
+	import_asset = "create",
+	duplicate_instance = "create",
+	move_instance = "create",
+	delete_instance = "delete",
+	run_luau = "luau",
+}
+local CAMINHOS_LIVE = { path = true, original = true, cloneOf = true }
+
+local function erroLive(code, message, nothingExecuted)
+	error({ code = code, message = message, nothingExecuted = nothingExecuted ~= false }, 0)
+end
+
+local function ponteLive()
+	local ok, pasta = pcall(function()
+		return servicoLive("CoreGui"):FindFirstChild(PONTE_LIVE)
+	end)
+	if not ok or pasta == nil then
+		return nil, nil
+	end
+	local invoke = pasta:FindFirstChild("Invoke")
+	if invoke == nil or not invoke:IsA("BindableFunction") then
+		return pasta, nil
+	end
+	return pasta, invoke
+end
+
+local function comGame(texto)
+	if type(texto) ~= "string" or texto == "" or texto == "?" or texto == "game" or string.sub(texto, 1, 5) == "game." then
+		return texto
+	end
+	return "game." .. texto
+end
+
+local function traduzirLive(valor, profundidade)
+	if typeof(valor) == "Instance" then
+		return caminhoDe(valor)
+	end
+	if type(valor) ~= "table" then
+		return valor
+	end
+	profundidade = profundidade or 0
+	if profundidade > 10 then
+		return nil
+	end
+	local out = {}
+	for chave, v in pairs(valor) do
+		if typeof(v) == "Instance" then
+			if chave == "instance" then
+				out.id = idDe(v)
+			elseif chave == "original" then
+				out.originalId = idDe(v)
+				out.original = caminhoDe(v)
+			else
+				out[chave] = caminhoDe(v)
+			end
+		elseif chave == "paths" and type(v) == "table" then
+			local lista = {}
+			for i, p in ipairs(v) do
+				lista[i] = comGame(p)
+			end
+			out.paths = lista
+		elseif CAMINHOS_LIVE[chave] and type(v) == "string" then
+			if out[chave] == nil then
+				out[chave] = comGame(v)
+			end
+		else
+			out[chave] = traduzirLive(v, profundidade + 1)
+		end
+	end
+	if typeof(valor.instance) == "Instance" then
+		out.path = caminhoDe(valor.instance)
+	end
+	return out
+end
+
+local function chamarLive(comando, args, segundos, prazoAbsoluto)
+	local pasta, invoke = ponteLive()
+	if pasta == nil or invoke == nil then
+		erroLive("LIVESESSION_MISSING", "A Sessao Viva (plugin LiveSession 1.1.0+, com a ponte MCP) nao esta carregada neste Studio. Instale o rbxm da Sessao Viva como plugin local e repita.")
+	end
+	local batida = pasta:GetAttribute("Heartbeat")
+	if type(batida) == "number" and os.time() - batida > 20 then
+		erroLive("LIVESESSION_STALE", "A ponte da Sessao Viva nao da sinal ha " .. tostring(os.time() - batida) .. "s (plugin descarregado ou travado). Recarregue o plugin LiveSession.")
+	end
+	local limite = segundos or 10
+	if prazoAbsoluto then
+		limite = math.min(limite, prazoAbsoluto - os.clock() - 0.5)
+	end
+	if limite <= 0 then
+		erroLive("EXECUTION_TIMEOUT", "Sem prazo restante para consultar a Sessao Viva.")
+	end
+	local pronto, ok, resultado = false, false, nil
+	local thread = task.spawn(function()
+		ok, resultado = pcall(function()
+			return invoke:Invoke(comando, args or {})
+		end)
+		pronto = true
+	end)
+	local fim = os.clock() + limite
+	while not pronto and os.clock() < fim do
+		task.wait(0.03)
+	end
+	if not pronto then
+		pcall(task.cancel, thread)
+		erroLive("LIVESESSION_TIMEOUT", "A Sessao Viva nao respondeu ao comando " .. comando .. " em " .. string.format("%.1f", limite) .. "s.", false)
+	end
+	if not ok then
+		erroLive("LIVESESSION_ERROR", "A Sessao Viva recusou " .. comando .. ": " .. tostring(resultado), false)
+	end
+	if type(resultado) ~= "table" then
+		resultado = { value = resultado }
+	end
+	return resultado, pasta
+end
+
+local function segundosDe(ms, padrao, teto)
+	if ms == nil then
+		return padrao
+	end
+	return math.min(math.max((tonumber(ms) or 0) / 1000, 0), teto)
+end
+
+local function filhoLive(servico, nome)
+	local ok, achado = pcall(function()
+		return servicoLive(servico):FindFirstChild(nome)
+	end)
+	if ok then
+		return achado
+	end
+	return nil
+end
+
+local function resumoImportLive()
+	local home = filhoLive("ServerStorage", "ImportMCP")
+	local out = { installed = home ~= nil }
+	local runtime = filhoLive("ReplicatedStorage", "ImportMCPRuntime")
+	out.runtimeVersion = runtime and runtime:GetAttribute("Version") or nil
+	local marca = filhoLive("CoreGui", "ImportMCPLive")
+	local token = marca and marca:GetAttribute("Token") or nil
+	out.liveToken = token ~= nil
+	local sessao, vivos, permanentes, pendentes, faltando = 0, 0, 0, 0, {}
+	local ok, lista = pcall(function()
+		return CollectionService:GetTagged("ImportMCP")
+	end)
+	for _, inst in ipairs(ok and lista or {}) do
+		if vivo(inst) then
+			local modo = inst:GetAttribute("ImportMCP_Mode")
+			local estado = inst:GetAttribute("ImportMCP_Status")
+			if modo == "asset" then
+				permanentes = permanentes + 1
+			elseif estado == "PendingUpload" then
+				pendentes = pendentes + 1
+			else
+				sessao = sessao + 1
+				if token ~= nil and inst:GetAttribute("ImportMCP_LiveToken") == token then
+					vivos = vivos + 1
+				elseif #faltando < 15 then
+					table.insert(faltando, caminhoDe(inst))
+				end
+			end
+		end
+	end
+	out.permanent = permanentes
+	out.sessionAssets = sessao
+	out.materialized = vivos
+	out.pendingMedia = pendentes
+	out.notMaterialized = faltando
+	return out
+end
+
+live.resumo = function()
+	local pasta = ponteLive()
+	if pasta == nil then
+		return nil
+	end
+	return {
+		state = pasta:GetAttribute("State"),
+		sessionId = pasta:GetAttribute("SessionId"),
+		engine = pasta:GetAttribute("Engine"),
+		reloads = pasta:GetAttribute("Reloads"),
+		version = pasta:GetAttribute("Version"),
+	}
+end
+
+live.ativa = function()
+	local pasta = ponteLive()
+	return pasta ~= nil and VIVOS_LIVE[pasta:GetAttribute("State")] == true
+end
+
+local function testeNativo()
+	local ok, t = pcall(estadoTeste)
+	local ativo = ok and type(t) == "table" and t.active == true
+	local okRun, rodando = pcall(function()
+		return servicoLive("RunService"):IsRunning()
+	end)
+	return ativo or (okRun and rodando == true), ok and type(t) == "table" and t.mode or nil
+end
+
+acoes.livesession_status = function(a)
+	local ctx = contextoAtual
+	local pasta, invoke = ponteLive()
+	local resultado
+	if pasta == nil or invoke == nil then
+		resultado = {
+			installed = false,
+			state = "Missing",
+			hint = "Plugin LiveSession (Sessao Viva) nao esta carregado neste Studio, ou e uma versao sem a ponte MCP. Instale o rbxm da Sessao Viva 1.1.0+ como plugin local; o usuario inicia a sessao pelo botao Iniciar Sessao Viva (ou use livesession_control action=start).",
+		}
+	else
+		resultado = traduzirLive((chamarLive("status", { detail = a.detail }, 10, ctx and ctx.deadline)))
+		resultado.installed = true
+		resultado.bridgeVersion = pasta:GetAttribute("Version")
+	end
+	local nativo, modo = testeNativo()
+	resultado.nativePlayTest = { active = nativo, mode = modo }
+	resultado.importmcp = resumoImportLive()
+	return resultado
+end
+
+acoes.livesession_control = function(a)
+	local ctx = contextoAtual
+	local prazo = ctx and ctx.deadline
+	local acao = tostring(a.action or "status")
+	local espera = segundosDe(a.waitMs, 0, 20)
+	local r
+	if acao == "status" then
+		return acoes.livesession_status(a)
+	elseif acao == "start" then
+		if testeNativo() then
+			erroLive("STUDIO_PLAYING", "Ha um play test nativo rodando; pare-o (studio_play action=stop) antes de iniciar a Sessao Viva.")
+		end
+		r = chamarLive("start", { wait = espera }, espera + 5, prazo)
+	elseif acao == "stop" then
+		r = chamarLive("stop", { wait = espera }, espera + 5, prazo)
+	elseif acao == "restart" then
+		if type(a.targets) ~= "table" or #a.targets == 0 then
+			erroLive("TARGET_REQUIRED", "Informe targets: os scripts a reiniciar no playtest da Sessao Viva.")
+		end
+		r = chamarLive("restart", { targets = a.targets }, 15, prazo)
+	elseif acao == "record" then
+		if type(a.targets) ~= "table" or #a.targets == 0 then
+			erroLive("TARGET_REQUIRED", "Informe targets e properties/attributes a registrar no journal.")
+		end
+		local props = type(a.properties) == "table" and a.properties or {}
+		local attrs = type(a.attributes) == "table" and a.attributes or {}
+		if #props == 0 and #attrs == 0 then
+			erroLive("PROPERTIES_REQUIRED", "Informe properties=[...] e/ou attributes=[...] (nomes) para registrar no journal.")
+		end
+		local itens = {}
+		for _, alvo in ipairs(a.targets) do
+			table.insert(itens, { target = alvo, properties = props, attributes = attrs })
+		end
+		r = chamarLive("record", { items = itens }, 10, prazo)
+	elseif acao == "resyncGui" then
+		r = chamarLive("resyncGui", {}, 10, prazo)
+	else
+		erroLive("INVALID_ACTION", "action deve ser status, start, stop, restart, record ou resyncGui.")
+	end
+	local saida = traduzirLive(r)
+	saida.action = acao
+	return saida
+end
+
+acoes.livesession_verify = function(a)
+	local ctx = contextoAtual
+	if type(a.targets) ~= "table" or #a.targets == 0 then
+		erroLive("TARGET_REQUIRED", "Informe targets: scripts/instancias a conferir na Sessao Viva.")
+	end
+	local espera = segundosDe(a.waitMs, 3, 20)
+	local r = traduzirLive((chamarLive(espera > 0 and "await" or "verify", { targets = a.targets, timeout = espera }, espera + 5, ctx and ctx.deadline)))
+	local total, aplicados, persistem = 0, 0, 0
+	for _, item in ipairs(type(r.results) == "table" and r.results or {}) do
+		total = total + 1
+		if item.live == nil then
+
+			item.live = item.exists == true
+		end
+		if item.live == true then
+			aplicados = aplicados + 1
+		end
+		if item.persist == true then
+			persistem = persistem + 1
+		end
+	end
+	r.summary = { total = total, live = aplicados, persist = persistem }
+	return r
+end
+
+acoes.livesession_journal = function(a)
+	local ctx = contextoAtual
+	local fonte = tostring(a.log or "journal")
+	if fonte == "output" then
+		return traduzirLive((chamarLive("output", { since = a.since, limit = a.limit, level = a.level, contains = a.contains }, 10, ctx and ctx.deadline)))
+	end
+	return traduzirLive((chamarLive("journal", { since = a.since, limit = a.limit, kind = a.kind, origin = a.origin, contains = a.contains }, 10, ctx and ctx.deadline)))
+end
+
+local function idsCriadosLive(resultado)
+	local ids = {}
+	if type(resultado.id) == "string" then
+		table.insert(ids, resultado.id)
+	end
+	for _, chave in ipairs({ "inserted", "created" }) do
+		if type(resultado[chave]) == "table" then
+			for _, item in ipairs(resultado[chave]) do
+				if type(item) == "table" and type(item.id) == "string" then
+					table.insert(ids, item.id)
+				end
+			end
+		end
+	end
+	return ids
+end
+
+live.aposEscrita = function(ev, resultado)
+	local tipo = ESCRITAS_LIVE[ev.tool]
+	if tipo == nil or type(resultado) ~= "table" then
+		return
+	end
+	local pasta, invoke = ponteLive()
+	if pasta == nil or invoke == nil then
+		return
+	end
+	local estado = pasta:GetAttribute("State")
+	if not VIVOS_LIVE[estado] then
+		return
+	end
+	local a = ev.args or {}
+	local bloco = { state = estado, sessionId = pasta:GetAttribute("SessionId") }
+	resultado.liveSession = bloco
+	if tipo == "luau" then
+		bloco.note = "run_luau roda no mesmo DataModel do playtest. Criacoes/remocoes feitas pelo codigo entram no journal (gravacao do historico); propriedades alteradas por codigo so persistem ao encerrar se voce registrar com livesession_control action=record (ou usar set_properties)."
+		return
+	end
+	if tipo == "delete" then
+		bloco.note = "Remocao feita dentro de uma gravacao do historico: a Sessao Viva registra como autoria e mantem ao encerrar."
+		return
+	end
+	local restante = (ev.deadline or (os.clock() + 5)) - os.clock() - 1
+	if restante <= 0.3 then
+		bloco.skipped = "sem prazo para conferir o hot reload; use livesession_verify"
+		return
+	end
+	local espera = math.min(segundosDe(a.liveWaitMs, ESPERA_LIVE, 20), math.max(0, restante - 0.5))
+	local okRun, erro = pcall(function()
+		local alvos = {}
+		local function incluir(inst)
+			if typeof(inst) ~= "Instance" then
+				return
+			end
+			for _, existente in ipairs(alvos) do
+				if existente == inst then
+					return
+				end
+			end
+			table.insert(alvos, inst)
+		end
+		if tipo == "script" or tipo == "props" then
+			incluir(a.target)
+		end
+		for _, id in ipairs(idsCriadosLive(resultado)) do
+			local okRes, inst = pcall(resolver, id, true)
+			if okRes then
+				incluir(inst)
+			end
+		end
+		if tipo == "props" and typeof(a.target) == "Instance" then
+			local props, attrs = {}, {}
+			for nome in pairs(type(a.properties) == "table" and a.properties or {}) do
+				if nome ~= "Source" then
+					table.insert(props, tostring(nome))
+				end
+			end
+			for nome in pairs(type(a.attributes) == "table" and a.attributes or {}) do
+				table.insert(attrs, tostring(nome))
+			end
+			if #props > 0 or #attrs > 0 then
+				local reg = chamarLive("record", { items = { { target = a.target, properties = props, attributes = attrs } } }, math.max(1, restante), ev.deadline)
+				bloco.recorded = reg.recorded
+				if type(reg.skipped) == "table" and #reg.skipped > 0 then
+					bloco.recordSkipped = traduzirLive(reg.skipped)
+				end
+				if type(reg.failed) == "table" and #reg.failed > 0 then
+					bloco.recordFailed = traduzirLive(reg.failed)
+				end
+			end
+		end
+		if #alvos == 0 then
+			return
+		end
+
+		task.wait()
+		local r = chamarLive("await", { targets = alvos, timeout = espera }, espera + 3, ev.deadline)
+		local itens = {}
+		local tudoVivo, tudoPersiste = true, true
+		for _, item in ipairs(type(r.results) == "table" and r.results or {}) do
+			local t = traduzirLive(item)
+			local vivoItem = t.live
+			if vivoItem == nil then
+				vivoItem = t.exists ~= false
+			end
+			if not vivoItem then
+				tudoVivo = false
+			end
+			if t.persist ~= true then
+				tudoPersiste = false
+			end
+			table.insert(itens, {
+				id = t.id,
+				path = t.path,
+				live = vivoItem,
+				persist = t.persist,
+				reason = t.reason,
+				liveReason = t.liveReason,
+				compileError = t.compileError,
+				loadIssue = t.loadIssue,
+				running = t.running,
+				synced = t.synced,
+			})
+		end
+		bloco.applied = tudoVivo
+		bloco.persisted = tudoPersiste
+		bloco.items = itens
+		bloco.waitedMs = r.waitedMs
+		bloco.reloads = r.reloads
+		if type(r.lastReload) == "table" then
+			bloco.lastReload = traduzirLive(r.lastReload)
+		end
+	end)
+	if not okRun then
+		bloco.error = type(erro) == "table" and tostring(erro.message or erro.code) or tostring(erro)
+	end
+end
+end
+
+
+do
+local RunServiceTeste=game:GetService('RunService')
+local StudioTestServiceTeste=nil
+pcall(function()StudioTestServiceTeste=game:GetService('StudioTestService')end)
+local teste={active=false}
+local testeContador=0
+
+local TESTE_INICIO_TIMEOUT_MS=30000
+local function agoraMsTeste()return DateTime.now().UnixTimestampMillis end
+local function simulando()
+ local ok,rodando=pcall(function()return RunServiceTeste:IsRunning() or not RunServiceTeste:IsEdit()end)
+ return ok and rodando==true
+end
+
+local function editorAtivo()
+ local ok,v=pcall(function()return StudioTestServiceTeste and StudioTestServiceTeste.EditModeActive end)
+ if ok and type(v)=='boolean' then return v end
+ return nil
+end
+
+local function foraDoEditor()
+ if simulando() then return true end
+ local ed=editorAtivo()
+ if ed~=nil then return not ed end
+ if teste.mode=='run' then return false end
+ return nil
+end
+local function encerrarTeste(result,err,motivo)
+ if not teste.active then return end
+ teste.active=false;teste.endedAt=agoraMsTeste()
+ if result~=nil then teste.result=result end
+ if err~=nil then teste.error=err end
+ teste.endedBy=motivo
+ acordarRelay()
+end
+
+local function reconciliarTeste(resultSeEncerrou,motivo)
+ if not teste.active then return end
+ local fora=foraDoEditor()
+ if fora==true then teste.sawRunning=true;return end
+ if fora==nil then return end
+ local decorrido=agoraMsTeste()-(teste.startedAt or 0)
+ if teste.sawRunning then
+  encerrarTeste(resultSeEncerrou or 'stopped_in_studio',nil,motivo or 'studio')
+ elseif decorrido>TESTE_INICIO_TIMEOUT_MS then
+  encerrarTeste(nil,'TEST_START_TIMEOUT: o Studio nao saiu do editor em '..math.floor(TESTE_INICIO_TIMEOUT_MS/1000)..'s apos o pedido de '..tostring(teste.mode)..'.','timeout')
+ end
+end
+estadoTeste=function()
+ reconciliarTeste()
+ local e={active=teste.active==true,mode=teste.mode,testId=teste.testId,startedAt=teste.startedAt,endedAt=teste.endedAt,endedBy=teste.endedBy,agent=teste.agent,players=teste.players,error=teste.error,api=StudioTestServiceTeste and 'StudioTestService' or 'RunService'}
+ if teste.result~=nil then e.result=codificar(teste.result)end
+ pcall(function()e.runService={isEdit=RunServiceTeste:IsEdit(),isRunMode=RunServiceTeste:IsRunMode(),isRunning=RunServiceTeste:IsRunning()}end)
+ local ed=editorAtivo();if ed~=nil then e.editModeActive=ed end
+ local okLive,resumoLive=pcall(live.resumo);if okLive and resumoLive~=nil then e.liveSession=resumoLive end
+ return e
+end
+local function falharTeste(code,message)error({code=code,message=message,nothingExecuted=true},0)end
+acoes.studio_play=function(a)
+ local action=string.lower(tostring(a.action or 'status'))
+ if action=='status' then local e=estadoTeste();e.action='status';return e end
+ if action=='reset' then
+
+  local anterior=teste.active and {mode=teste.mode,testId=teste.testId,startedAt=teste.startedAt} or nil
+  teste={active=false,endedAt=agoraMsTeste(),endedBy='reset'}
+  acordarRelay()
+  local e=estadoTeste();e.action='reset';e.discarded=anterior;e.stillSimulating=foraDoEditor()==true;return e
+ end
+ if action=='play' or action=='run' or action=='multiplayer' then
+
+  if live.ativa() then falharTeste('LIVESESSION_ACTIVE','A Sessao Viva (LiveSession) esta rodando neste Studio e o playtest dela ja roda no editor com hot reload. Encerre-a (livesession_control action=stop) antes do Play nativo, ou valide pela propria Sessao Viva (livesession_verify, get_logs).')end
+  reconciliarTeste()
+  if teste.active then falharTeste('TEST_ALREADY_RUNNING','Ja existe uma sessao iniciada pelo MCP ('..tostring(teste.mode)..', '..tostring(teste.testId)..'). Use action=stop antes de iniciar outra; se o Studio ja esta no editor e o estado ficou preso, use action=reset.')end
+  if foraDoEditor()==true then falharTeste('TEST_ALREADY_RUNNING','O Studio ja esta em simulacao (iniciada pelo usuario). Use action=stop ou pare pelo Studio antes de iniciar outra.')end
+  if action~='run' and not StudioTestServiceTeste then falharTeste('TEST_API_UNAVAILABLE','Este Studio nao expoe StudioTestService; Play Solo e multiplayer por plugin exigem um Studio recente. Use action=run (RunService:Run, como F8).')end
+  local players=math.clamp(math.floor(tonumber(a.players)or 2),1,8)
+  testeContador=testeContador+1
+  local id='t_'..peer..'_'..tostring(testeContador)
+  local agente=contextoAtual and contextoAtual.agent or nil
+  teste={active=true,mode=action,testId=id,startedAt=agoraMsTeste(),agent=agente,players=(action=='multiplayer') and players or nil}
+  local args={mcp=true,testId=id,peer=peer,agent=agente,mode=action}
+  task.spawn(function()
+   local ok,res=pcall(function()
+    if action=='run' then
+     if StudioTestServiceTeste then return StudioTestServiceTeste:ExecuteRunModeAsync(args)end
+     RunServiceTeste:Run();task.wait(0.5)
+     while RunServiceTeste:IsRunning() or not RunServiceTeste:IsEdit() do task.wait(0.25)end
+     return nil
+    elseif action=='play' then return StudioTestServiceTeste:ExecutePlayModeAsync(args)
+    else return StudioTestServiceTeste:ExecuteMultiplayerTestAsync(players,args)end
+   end)
+
+   if teste.testId==id and teste.active then
+    if ok then encerrarTeste(res,nil,'api')else encerrarTeste(nil,tostring(type(res)=='table' and res.message or res),'api')end
+   end
+  end)
+
+  for _=1,5 do task.wait();if not teste.active then break end end
+  if not teste.active and teste.error then local msg=teste.error;teste={active=false};error({code='TEST_START_FAILED',message=msg,nothingExecuted=true},0)end
+  acordarRelay()
+  local e=estadoTeste();e.action=action;return e
+ end
+ if action=='stop' then
+  local tentativas={}
+  if StudioTestServiceTeste and not RunServiceTeste:IsEdit() then
+
+   local ok,e=pcall(function()StudioTestServiceTeste:EndTest('mcp_stop')end)
+   table.insert(tentativas,{api='StudioTestService.EndTest',ok=ok,error=(not ok) and tostring(e) or nil})
+  end
+  local ok,e=pcall(function()RunServiceTeste:Stop()end)
+  table.insert(tentativas,{api='RunService.Stop',ok=ok,error=(not ok) and tostring(e) or nil})
+  for _=1,10 do task.wait(0.1);reconciliarTeste('mcp_stop','stop');if not teste.active and foraDoEditor()~=true then break end end
+
+  if teste.active and foraDoEditor()~=true then encerrarTeste('mcp_stop',nil,'stop')end
+  acordarRelay()
+  local st=estadoTeste();st.action='stop';st.attempts=tentativas;st.stillSimulating=foraDoEditor()==true;return st
+ end
+ if action=='pause' or action=='resume' then
+  if not simulando() then falharTeste('TEST_NOT_RUNNING','Nenhuma simulacao neste DataModel. Em Play Solo o pause/resume e enviado ao servidor da sessao pelo Worker; em Run mode a simulacao precisa estar ativa.')end
+  if action=='pause' then RunServiceTeste:Pause() else RunServiceTeste:Run() end
+  task.wait()
+  local st=estadoTeste();st.action=action;return st
+ end
+ falharTeste('INVALID_ACTION','action deve ser play, run, multiplayer, stop, pause, resume, status ou reset.')
+end
+end
+
+
+do
+
+local SerializationServiceExp = nil
+pcall(function() SerializationServiceExp = game:GetService("SerializationService") end)
+local AssetServiceExp = game:GetService("AssetService")
+local TAM_PEDACO = 512 * 1024
+local INLINE_MAX = 64 * 1024
+local CAMPOS_ASSET = { "MeshId", "TextureID", "TextureId", "Texture", "Image", "HoverImage", "PressedImage", "SoundId", "Video", "AnimationId", "ColorMap", "NormalMap", "MetalnessMap", "RoughnessMap", "SkyboxBk", "SkyboxDn", "SkyboxFt", "SkyboxLf", "SkyboxRt", "SkyboxUp", "SunTextureId", "MoonTextureId", "Decal" }
+
+local function urlEncode(s)
+	return (string.gsub(tostring(s), "[^%w%-_%.~]", function(c) return string.format("%%%02X", string.byte(c)) end))
+end
+local function nomeSeguro(nome, padrao)
+	local s = tostring(nome or ""):gsub("[\\/:*?\"<>|%c]", "_"):gsub("^%s+", ""):gsub("%s+$", "")
+	if s == "" then s = padrao end
+	return string.sub(s, 1, 120)
+end
+local function pedirBinario(caminho, corpo)
+	local h = { ["Content-Type"] = "application/octet-stream", ["Accept"] = "application/json" }
+	if chave ~= "" then h.Authorization = "Bearer " .. chave end
+	local ok, response = pcall(function()
+		return HttpService:RequestAsync({ Url = urlBase .. "/" .. caminho, Method = "POST", Headers = h, Body = corpo })
+	end)
+	if not ok then return nil, tostring(response) end
+	if not response.Success then return nil, "HTTP " .. tostring(response.StatusCode) .. " " .. string.sub(tostring(response.Body), 1, 250) end
+	local parsed, data = pcall(function() return HttpService:JSONDecode(response.Body) end)
+	if not parsed then return nil, "Resposta ilegivel do Worker" end
+	return data, nil
+end
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+local function base64(s)
+	local out, orcamento = {}, novoOrcamento()
+	for i = 1, #s, 3 do
+		respirar(orcamento)
+		local a, b, c = string.byte(s, i, i + 2)
+		local n = a * 65536 + (b or 0) * 256 + (c or 0)
+		local c1, c2, c3, c4 = math.floor(n / 262144) % 64, math.floor(n / 4096) % 64, math.floor(n / 64) % 64, n % 64
+		out[#out + 1] = string.sub(B64, c1 + 1, c1 + 1) .. string.sub(B64, c2 + 1, c2 + 1) .. (b and string.sub(B64, c3 + 1, c3 + 1) or "=") .. (c and string.sub(B64, c4 + 1, c4 + 1) or "=")
+	end
+	return table.concat(out)
+end
+local function falharExport(code, message, extra)
+	local e = extra or {}
+	e.code, e.message = code, message
+	if e.nothingExecuted == nil then e.nothingExecuted = true end
+	error(e, 0)
+end
+local function conferirPrazo(ctx)
+	if ctx and ctx.cancelled then falharExport("CANCELLED", "exportacao cancelada.", { nothingExecuted = false }) end
+	if ctx and ctx.deadline and os.clock() >= ctx.deadline then falharExport("EXECUTION_TIMEOUT", "o prazo da chamada acabou durante o envio do arquivo; arquivos maiores levam mais pedacos. Tente de novo ou exporte uma parte menor.", { nothingExecuted = false }) end
+end
+
+local function enviarArquivo(nome, tipo, dados, ctx, usarB64)
+	local total = #dados
+	local tam = usarB64 and math.floor(TAM_PEDACO * 3 / 4 / 3) * 3 or TAM_PEDACO
+	local uploadId, parte, pos = nil, 0, 1
+	while true do
+		parte = parte + 1
+		local fim = pos + tam > total
+		local pedaco = string.sub(dados, pos, math.min(total, pos + tam - 1))
+		pos = pos + tam
+		local corpo = usarB64 and base64(pedaco) or pedaco
+		local q = "arquivo?peer=" .. peer .. "&nome=" .. urlEncode(nome) .. "&tipo=" .. urlEncode(tipo) .. "&parte=" .. parte .. "&len=" .. #corpo .. (usarB64 and "&b64=1" or "") .. (uploadId and ("&id=" .. uploadId) or "") .. (fim and "&fim=1" or "")
+		local resp, err = pedirBinario(q, corpo)
+		if err then
+			if not usarB64 and uploadId == nil and (string.find(err, "BYTES_MISMATCH", 1, true) or string.match(err, "^HTTP 400")) then
+				return enviarArquivo(nome, tipo, dados, ctx, true)
+			end
+			if string.match(err, "^HTTP 404") then
+				falharExport("WORKER_UPDATE_REQUIRED", "o Worker nao conhece a rota /arquivo: faca o redeploy do Worker 2.8.2 (npx wrangler deploy) e repita.", { nothingExecuted = false })
+			end
+			falharExport("UPLOAD_FAILED", "nao consegui enviar o arquivo ao Worker: " .. err, { nothingExecuted = false })
+		end
+		if type(resp) ~= "table" or resp.ok ~= true then
+			local motivo = type(resp) == "table" and (type(resp.erro) == "table" and resp.erro.message or resp.erro) or "resposta inesperada"
+			falharExport("UPLOAD_FAILED", "o Worker recusou o arquivo: " .. tostring(motivo), { nothingExecuted = false })
+		end
+		if fim then return resp end
+		uploadId = resp.uploadId or uploadId
+		if not uploadId then falharExport("UPLOAD_FAILED", "o Worker nao devolveu uploadId.", { nothingExecuted = false }) end
+		conferirPrazo(ctx)
+		task.wait()
+	end
+end
+local function idDeConteudo(v)
+	if typeof(v) == "Content" then
+		local ok, uri = pcall(function() return v.Uri end)
+		v = ok and uri or nil
+	end
+	if type(v) ~= "string" or v == "" then return nil, nil end
+	local id = string.match(v, "^rbxassetid://(%d+)") or string.match(v, "[?&]id=(%d+)") or string.match(v, "^rbxasset://(%d+)")
+	return tonumber(id), v
+end
+
+local function assetsDe(inst, recursivo, teto)
+	local lista, vistos, n = {}, {}, 0
+	local function colher(obj)
+		for _, campo in ipairs(CAMPOS_ASSET) do
+			local ok, v = pcall(function() return obj[campo] end)
+			if ok and v ~= nil then
+				local id, uri = idDeConteudo(v)
+				if id and not vistos[id] then
+					vistos[id] = true
+					table.insert(lista, { assetId = id, uri = uri, property = campo, path = caminhoDe(obj), className = obj.ClassName })
+				end
+			end
+		end
+	end
+	colher(inst)
+	if recursivo then
+		local orcamento = novoOrcamento()
+		for _, d in ipairs(inst:GetDescendants()) do
+			respirar(orcamento)
+			n = n + 1
+			if n > teto then break end
+			colher(d)
+		end
+	end
+	return lista
+end
+local function f6(x) return string.format("%.6g", x) end
+
+local function exportarObj(part, maxBytes, ctx)
+	local meshId, malha, criado, escala = nil, nil, false, nil
+	if part:IsA("MeshPart") then
+		meshId = part.MeshId
+		local okC, conteudo = pcall(function() return part.MeshContent end)
+		if okC and conteudo ~= nil then
+			local okO, obj = pcall(function() return conteudo.SourceType == Enum.ContentSourceType.Object and conteudo.Object or nil end)
+			if okO and obj ~= nil then malha = obj end
+		end
+		pcall(function()
+			local ms = part.MeshSize
+			if ms and ms.X > 0 and ms.Y > 0 and ms.Z > 0 then escala = { f6(part.Size.X / ms.X), f6(part.Size.Y / ms.Y), f6(part.Size.Z / ms.Z) } end
+		end)
+	elseif part:IsA("SpecialMesh") then
+		if part.MeshType == Enum.MeshType.FileMesh then meshId = part.MeshId end
+		pcall(function() escala = { f6(part.Scale.X), f6(part.Scale.Y), f6(part.Scale.Z) } end)
+	elseif part:IsA("BasePart") then
+		local sm = part:FindFirstChildWhichIsA("SpecialMesh")
+		if sm and sm.MeshType == Enum.MeshType.FileMesh then
+			meshId = sm.MeshId
+			pcall(function() escala = { f6(sm.Scale.X), f6(sm.Scale.Y), f6(sm.Scale.Z) } end)
+		end
+	end
+	if malha == nil then
+		if meshId == nil or meshId == "" then falharExport("NO_MESH", caminhoDe(part) .. " nao tem malha exportavel (MeshPart com MeshId, Part com SpecialMesh FileMesh ou SpecialMesh). Para o arquivo do Studio use kind=rbxm.") end
+		local ok, em = pcall(function() return AssetServiceExp:CreateEditableMeshAsync(Content.fromUri(meshId)) end)
+		if not ok or em == nil then
+			local ok2, em2 = pcall(function() return AssetServiceExp:CreateEditableMeshAsync(meshId) end)
+			if ok2 and em2 ~= nil then ok, em = true, em2 end
+		end
+		if not ok or em == nil then
+			falharExport("MESH_UNAVAILABLE", "EditableMesh indisponivel para " .. tostring(meshId) .. ": " .. string.sub(tostring(em), 1, 160) .. ". Mesh de terceiro ou sem permissao de leitura; baixe o asset original pela URL em assets (kind=asset).", { meshId = meshId })
+		end
+		malha, criado = em, true
+	end
+	local out = {}
+	local okV, ids = pcall(function() return malha:GetVertices() end)
+	local okF, fids = pcall(function() return malha:GetFaces() end)
+	if not okV or type(ids) ~= "table" or not okF or type(fids) ~= "table" then
+		if criado then pcall(function() malha:Destroy() end) end
+		falharExport("MESH_UNAVAILABLE", "EditableMesh sem vertices/faces legiveis.")
+	end
+	local orcamento = novoOrcamento()
+	local bytes = 0
+	local function linha(s)
+		out[#out + 1] = s
+		bytes = bytes + #s + 1
+		if bytes > maxBytes then
+			if criado then pcall(function() malha:Destroy() end) end
+			falharExport("RESULT_TOO_LARGE", "o OBJ passou de " .. math.floor(maxBytes / 1024) .. " KB (maxBytes); malha com " .. #ids .. " vertices. Aumente maxBytes ou baixe o asset original.", { vertices = #ids, faces = #fids })
+		end
+	end
+	linha("# exportado pelo MCP Studio a partir de " .. caminhoDe(part))
+	linha("# meshId " .. tostring(meshId or "(EditableMesh da propria peca)") .. (escala and (" | escala da peca (Size/MeshSize ou SpecialMesh.Scale): " .. table.concat(escala, " ")) or ""))
+	linha("# coordenadas em espaco da malha (studs, sem escala da peca); vt com V invertido (origem inferior esquerda do OBJ)")
+	linha("o " .. nomeSeguro(part.Name, "mesh"):gsub("%s+", "_"))
+	local idx = {}
+	for i, vid in ipairs(ids) do
+		respirar(orcamento)
+		local okP, p = pcall(function() return malha:GetPosition(vid) end)
+		if okP and p ~= nil then
+			idx[vid] = i
+			linha("v " .. f6(p.X) .. " " .. f6(p.Y) .. " " .. f6(p.Z))
+		end
+	end
+	local nidx, uidx, normais, uvs = {}, {}, 0, 0
+	pcall(function()
+		for i, nid in ipairs(malha:GetNormals()) do
+			respirar(orcamento)
+			local nv = malha:GetNormal(nid)
+			nidx[nid] = i
+			normais = normais + 1
+			linha("vn " .. f6(nv.X) .. " " .. f6(nv.Y) .. " " .. f6(nv.Z))
+		end
+	end)
+	pcall(function()
+		for i, uid in ipairs(malha:GetUVs()) do
+			respirar(orcamento)
+			local uv = malha:GetUV(uid)
+			uidx[uid] = i
+			uvs = uvs + 1
+			linha("vt " .. f6(uv.X) .. " " .. f6(1 - uv.Y))
+		end
+	end)
+	local faces = 0
+	for _, fid in ipairs(fids) do
+		respirar(orcamento)
+		local okFV, vs = pcall(function() return malha:GetFaceVertices(fid) end)
+		if okFV and type(vs) == "table" and #vs >= 3 then
+			local ns = nil
+			if normais > 0 then local okN, r = pcall(function() return malha:GetFaceNormals(fid) end); if okN and type(r) == "table" then ns = r end end
+			local us = nil
+			if uvs > 0 then local okU, r = pcall(function() return malha:GetFaceUVs(fid) end); if okU and type(r) == "table" then us = r end end
+			local partes = {}
+			for k = 1, #vs do
+				local vi = idx[vs[k]]
+				if vi == nil then partes = nil; break end
+				local ti = us and uidx[us[k]] or nil
+				local ni = ns and nidx[ns[k]] or nil
+				if ni then partes[k] = vi .. "/" .. (ti or "") .. "/" .. ni
+				elseif ti then partes[k] = vi .. "/" .. ti
+				else partes[k] = tostring(vi) end
+			end
+			if partes then
+				faces = faces + 1
+				linha("f " .. table.concat(partes, " "))
+			end
+		end
+	end
+	if criado then pcall(function() malha:Destroy() end) end
+	conferirPrazo(ctx)
+	return table.concat(out, "\n") .. "\n", { vertices = #ids, faces = faces, normals = normais, uvs = uvs, meshId = meshId }
+end
+local function bytesDoBuffer(buf)
+	if type(buf) == "string" then return buf end
+	if typeof(buf) == "buffer" and type(buffer) == "table" then return buffer.tostring(buf) end
+	falharExport("SERIALIZE_FAILED", "SerializeInstancesAsync devolveu um valor inesperado (" .. typeof(buf) .. ").")
+end
+acoes.export_file = function(a)
+	local ctx = contextoAtual
+	local inicio = os.clock()
+	local tipo = string.lower(tostring(a.kind or "auto"))
+	local maxBytes = math.clamp(math.floor(tonumber(a.maxBytes) or 20000000), 1024, 40000000)
+	local inline = a.inline ~= false
+	local alvo = a.target ~= nil and resolver(a.target) or nil
+	if alvo == nil then
+		local id = math.floor(tonumber(a.assetId) or 0)
+		if id <= 0 then falharExport("TARGET_REQUIRED", "informe target (instancia do place) ou assetId (numero do asset).") end
+		return { kind = "asset", assets = { { assetId = id, uri = "rbxassetid://" .. id } }, notes = { "sem target: apenas o asset original, baixado pelo Worker" }, ms = 0 }
+	end
+	if alvo == game then falharExport("PROTECTED_ROOT", "exporte um servico, pasta, modelo ou instancia; nao o game inteiro.") end
+	local saida = resumo(alvo)
+	saida.notes = {}
+	local assets = assetsDe(alvo, tipo ~= "script", 2000)
+	if tipo == "auto" then
+		if alvo:IsA("LuaSourceContainer") then tipo = "script"
+		elseif alvo:IsA("MeshPart") or alvo:IsA("SpecialMesh") or (alvo:IsA("BasePart") and alvo:FindFirstChildWhichIsA("SpecialMesh") ~= nil) then tipo = "obj"
+		elseif #assets > 0 and (alvo:IsA("Decal") or alvo:IsA("Texture") or alvo:IsA("ImageLabel") or alvo:IsA("ImageButton") or alvo:IsA("Sound") or alvo:IsA("VideoFrame") or alvo:IsA("Sky") or alvo:IsA("Animation") or alvo:IsA("SurfaceAppearance")) then tipo = "asset"
+		else tipo = "rbxm" end
+	end
+	saida.kind = tipo
+	if #assets > 0 then
+		saida.assets = {}
+		for i, item in ipairs(assets) do
+			if i > 100 then table.insert(saida.notes, (#assets - 100) .. " asset(s) a mais omitidos; use kind=asset em uma subarvore menor"); break end
+			saida.assets[i] = item
+		end
+	end
+	local dados, nome, mime = nil, nil, nil
+	if tipo == "script" then
+		if not alvo:IsA("LuaSourceContainer") then falharExport("NOT_SCRIPT", caminhoDe(alvo) .. " nao e um script (e " .. alvo.ClassName .. "); use kind=rbxm para o arquivo do Studio.") end
+		dados = fonteDe(alvo)
+		local sufixo = ".lua"
+		if alvo.ClassName == "LocalScript" then sufixo = ".client.lua" elseif alvo.ClassName == "Script" then sufixo = ".server.lua" end
+		nome = nomeSeguro(a.fileName, alvo.Name .. sufixo)
+		mime = "text/x-lua; charset=utf-8"
+		local _, quebras = string.gsub(dados, "\n", "")
+		saida.lines = quebras + 1
+		if ctx and ctx.agent then saida.revision = controle:read(ctx.agent, alvo, dados) end
+	elseif tipo == "obj" then
+		local info
+		dados, info = exportarObj(alvo, maxBytes, ctx)
+		nome = nomeSeguro(a.fileName, alvo.Name .. ".obj")
+		mime = "model/obj"
+		saida.mesh = info
+	elseif tipo == "rbxm" then
+		if not SerializationServiceExp then falharExport("SERIALIZATION_UNAVAILABLE", "este Studio nao expoe SerializationService (exige Studio de 2025 em diante); atualize o Studio ou exporte scripts com kind=script.") end
+		local instancias = { alvo }
+		if alvo.Parent == game then
+			instancias = alvo:GetChildren()
+			if #instancias == 0 then falharExport("EMPTY_SERVICE", caminhoDe(alvo) .. " nao tem filhos para exportar.") end
+			table.insert(saida.notes, "servico: exportados os " .. #instancias .. " filhos de " .. caminhoDe(alvo))
+		end
+		local okS, buf = pcall(function() return SerializationServiceExp:SerializeInstancesAsync(instancias) end)
+		if not okS then falharExport("SERIALIZE_FAILED", "SerializeInstancesAsync falhou: " .. string.sub(tostring(buf), 1, 300)) end
+		dados = bytesDoBuffer(buf)
+		nome = nomeSeguro(a.fileName, alvo.Name .. ".rbxm")
+		mime = "application/octet-stream"
+		local n = 0
+		for _, inst in ipairs(instancias) do n = n + 1 + #inst:GetDescendants() end
+		saida.instances = n
+	elseif tipo == "asset" then
+		if #assets == 0 then falharExport("NO_ASSETS", caminhoDe(alvo) .. " nao referencia nenhum asset (MeshId/TextureID/Texture/Image/SoundId...). Use kind=rbxm para o arquivo do Studio.") end
+		saida.ms = math.floor((os.clock() - inicio) * 1000)
+		return saida
+	else
+		falharExport("INVALID_KIND", "kind deve ser auto, script, rbxm, obj ou asset.")
+	end
+	if #dados > maxBytes then falharExport("RESULT_TOO_LARGE", "o arquivo tem " .. math.floor(#dados / 1024) .. " KB, acima de maxBytes (" .. math.floor(maxBytes / 1024) .. " KB). Aumente maxBytes (ate 40 MB) ou exporte uma parte menor.", { bytes = #dados }) end
+	conferirPrazo(ctx)
+	saida.bytes = #dados
+	saida.fileName = nome
+	local resp = enviarArquivo(nome, mime, dados, ctx, false)
+	saida.url = resp.url
+	saida.blobId = resp.id
+	saida.expiresInSeconds = resp.expiresInSeconds
+	if inline and tipo ~= "rbxm" and #dados <= INLINE_MAX then saida.content = dados end
+	saida.ms = math.floor((os.clock() - inicio) * 1000)
+	return saida
+end
+end
+
+
+local NOMES = {}
+for nome in pairs(acoes) do
+	table.insert(NOMES, nome)
+end
+table.sort(NOMES)
+
+local atualizarUi=function()end
+local cacheEventos,ordemEventos={},{}
+local execucoes,emExecucao={},0
+local limpezasPendentes={}
+local consumindoThread,enviandoThread=nil,nil
+local MAX_PARALELO,MAX_CACHE,LOTE_RESPOSTAS=4,300,10
+local COALESCER_RESPOSTAS=0.05
+local LIMITE_ITEM_BYTES,LIMITE_LOTE_BYTES=700*1024,900*1024
+local GRACA_ORFAO=3
+local bytesDe=setmetatable({},{__mode='k'})
+local function textoErro(e)return type(e)=='table' and tostring(e.message or e.code or 'erro de controle') or tostring(e)end
+local function threadViva(t)return t~=nil and coroutine.status(t)~='dead' end
+local function pedir(caminho,corpo,base,secret)
+ base=base or urlBase;if secret==nil then secret=chave end
+ local h={['Content-Type']='application/json',['Accept']='application/json'};if secret~=''then h.Authorization='Bearer '..secret end
+ local ok,response=pcall(function()return HttpService:RequestAsync({Url=base..'/'..caminho,Method=corpo==nil and 'GET' or 'POST',Headers=h,Body=corpo~=nil and HttpService:JSONEncode(corpo) or nil})end)
+ if not ok then return nil,tostring(response)end
+ if not response.Success then return nil,'HTTP '..tostring(response.StatusCode)..' '..string.sub(tostring(response.Body),1,250)end
+ local parsed,data=pcall(function()return HttpService:JSONDecode(response.Body)end)
+ if not parsed then return nil,'Resposta ilegivel do Worker'end;return data,nil
+end
+local function identidade()
+ local studio='';pcall(function()studio=tostring(version())end)
+ local resumo=controle:summary();resumo.executing=emExecucao;resumo.pendingCleanups=#limpezasPendentes
+ return {peer=peer,lugar=game.Name,placeId=game.PlaceId,versao=VERSAO,studio=studio,ferramentas=NOMES,controle=resumo,teste=estadoTeste()}
+end
+
+local function confirmar(lote)
+ for _,item in ipairs(lote)do local cached=cacheEventos[item.reqId];if cached then cacheEventos[item.reqId]={acked=true}end end
+end
+local function erroDefinitivo(e)
+
+ return type(e)=='string' and string.match(e,'^HTTP 4%d%d')~=nil
+end
+
+local function medirItem(item)
+ local ok,json=pcall(function()return HttpService:JSONEncode(item)end)
+ local tamanho=(ok and type(json)=='string') and #json or 0
+ if not ok then
+  item={reqId=item.reqId,ok=false,erro={code='RESULT_UNSERIALIZABLE',message='O resultado nao pode ser serializado em JSON ('..tostring(json)..'). Retorne tabelas simples, numeros e strings.',nothingExecuted=false}}
+  tamanho=400
+ elseif tamanho>LIMITE_ITEM_BYTES then
+  item={reqId=item.reqId,ok=false,erro={code='RESULT_TOO_LARGE',message='O resultado tem '..math.floor(tamanho/1024)..'KB, acima do limite de '..math.floor(LIMITE_ITEM_BYTES/1024)..'KB por chamada. A execucao ACONTECEU no Studio; apenas o retorno foi descartado. Retorne menos dados (filtre, pagine, agregue) e repita so a leitura.',nothingExecuted=false,bytes=tamanho}}
+  tamanho=600
+ end
+ bytesDe[item]=tamanho
+ return item
+end
+local function retirarLote()
+ local lote,bytes={},0
+ while #lote<LOTE_RESPOSTAS and #bufferRespostas>0 do
+  local proximo=bufferRespostas[1]
+  local tamanho=bytesDe[proximo] or 0
+  if #lote>0 and bytes+tamanho>LIMITE_LOTE_BYTES then break end
+  table.insert(lote,table.remove(bufferRespostas,1));bytes=bytes+tamanho
+ end
+ return lote
+end
+local function devolverLote(lote)for i=#lote,1,-1 do table.insert(bufferRespostas,1,lote[i])end end
+
+local function tratarFalhaLote(lote,e)
+ if not erroDefinitivo(e) then devolverLote(lote);return end
+ if #lote>1 then
+  for _,item in ipairs(lote)do bytesDe[item]=LIMITE_LOTE_BYTES end
+  devolverLote(lote);return
+ end
+ local item=lote[1]
+ if item and not item.rejeitado then
+  local leve={reqId=item.reqId,ok=false,rejeitado=true,erro={code='RESPONSE_REJECTED',message='O Worker recusou a resposta original ('..tostring(e)..'); o resultado foi descartado. A execucao pode ter acontecido no Studio.',nothingExecuted=false}}
+  bytesDe[leve]=500
+  table.insert(bufferRespostas,1,leve)
+ end
+end
+local function enviarRespostas()
+ if threadViva(enviandoThread) then return end
+ local generation,base,secret=geracao,urlBase,chave
+ enviandoThread=task.spawn(function()
+
+  task.wait(COALESCER_RESPOSTAS)
+  while conectado and generation==geracao and #bufferRespostas>0 do
+   local lote=retirarLote()
+   local _,e=pedir('resposta',{peer=peer,itens=lote},base,secret)
+   if generation~=geracao then break end
+   if e then
+    tratarFalhaLote(lote,e);ultimoErro=e
+
+    if not erroDefinitivo(e) then break end
+    task.wait(COALESCER_RESPOSTAS)
+   else confirmar(lote)end
+  end
+ end)
+end
+local function limparContexto(ctx)
+ local safe=true
+ for i=#ctx.cleanups,1,-1 do
+  local ok,e=pcall(ctx.cleanups[i])
+  if ok then table.remove(ctx.cleanups,i)else safe=false;ultimoErro=textoErro(e)end
+ end
+ for rec in pairs(ctx.recordings)do
+  local ok,e=pcall(function()ChangeHistoryService:FinishRecording(rec,Enum.FinishRecordingOperation.Cancel)end)
+  if ok then ctx.recordings[rec]=nil else safe=false;ultimoErro=textoErro(e)end
+ end
+ return safe
+end
+
+local function tentarLimpezasPendentes()
+ for i=#limpezasPendentes,1,-1 do
+  local ctx=limpezasPendentes[i]
+  if limparContexto(ctx)then (ctx.owner or controle):finish(ctx,false);table.remove(limpezasPendentes,i)end
+ end
+end
+local function reterContexto(ctx)
+ for _,pending in ipairs(limpezasPendentes)do if pending==ctx then return end end
+ table.insert(limpezasPendentes,ctx)
+end
+local function eventoValido(ev)
+ return conectado and ev.generation==geracao and not ev.cancelled and os.clock()<ev.deadline
+end
+
+local function pedirTickets(rodada)
+
+ local lote={};for _,ev in ipairs(rodada)do if type(ev.ticket)~='table' then table.insert(lote,ev)end end
+ if #lote==0 then return end
+ local ids={};for _,ev in ipairs(lote)do table.insert(ids,ev.reqId)end
+ local resposta,err
+ if #ids==1 then resposta,err=pedir('iniciar',{peer=peer,reqId=ids[1]})
+ else
+  resposta,err=pedir('iniciar',{peer=peer,reqIds=ids})
+
+  if resposta and type(resposta.tickets)~='table' and not err then
+   for _,ev in ipairs(lote)do ev.ticket=nil end
+   return
+  end
+ end
+ for _,ev in ipairs(lote)do
+  local ticket=nil
+  if resposta then
+   if type(resposta.tickets)=='table' then ticket=resposta.tickets[ev.reqId]
+   elseif #ids==1 then ticket=resposta end
+  end
+  ev.ticket=ticket or {ok=false,erro=err or (resposta and resposta.erro) or 'Pedido nao autorizado para iniciar.'}
+ end
+end
+local function executarProtegido(ev)
+ tentarLimpezasPendentes()
+ if not eventoValido(ev) then falharControle('REQUEST_EXPIRED','Pedido expirado/cancelado antes de executar.')end
+ local ticket,err=ev.ticket,nil
+ if ticket==nil then ticket,err=pedir('iniciar',{peer=peer,reqId=ev.reqId})end
+ if not ticket or ticket.ok~=true then falharControle('REQUEST_EXPIRED',err or (ticket and (type(ticket.erro)=='table' and ticket.erro.message or ticket.erro)) or 'Pedido nao autorizado para iniciar.')end
+ if not conectado or ev.generation~=geracao or ev.cancelled then falharControle('CANCELLED','Conexao alterada antes de iniciar.')end
+ if ticket.agent~=ev.agent or type(ev.agent)~='string' or ev.agent=='' then falharControle('AGENT_MISMATCH','Identidade do evento diverge do Worker.')end
+ ev.deadline=math.min(ev.deadline,os.clock()+math.max(0,tonumber(ticket.prazoMs)or 0)/1000)
+ if ev.tool=='run_luau'then ev.deadline=math.min(ev.deadline,os.clock()+math.clamp(tonumber(ev.args.timeoutMs)or 30000,100,40000)/1000)end
+ if os.clock()>=ev.deadline then falharControle('REQUEST_EXPIRED','Nao sobrou prazo para executar.')end
+ controle:configure(ev.controle)
+ local plans=prepararControle(ev)
+ local dono=controle
+ local ctx=dono:begin(ev.agent,plans,ev.tool);ctx.owner=dono;ctx.deadline=ev.deadline
+ ev.context=ctx
+ local finished,packed,thread=false,nil,nil
+ local anterior=contextoAtual
+ contextoAtual=ctx
+ local okStart,startError=pcall(function()
+  verificarVersoes(ev)
+  local depois=vigiarRunLuau(ev);ctx.afterRun=depois
+  thread=task.spawn(function()packed=table.pack(pcall(acoes[ev.tool],ev.args));finished=true end)
+ end)
+ if contextoAtual==ctx then contextoAtual=anterior end
+ if not okStart then packed={false,startError,n=2};finished=true end
+ while not finished do
+  if ev.cancelled or ev.generation~=geracao or not conectado or os.clock()>=ev.deadline then
+   ctx.cancelled=true
+   if thread and coroutine.status(thread)~='dead' then
+    local alvo=thread
+    table.insert(ctx.cleanups,function()if coroutine.status(alvo)~='dead' then task.cancel(alvo)end end)
+   end
+   packed={false,{code=ev.cancelled and 'CANCELLED' or 'EXECUTION_TIMEOUT',message='Execucao encerrada pelo prazo/cancelamento. Confira o estado antes de repetir.',nothingExecuted=false},n=2};finished=true
+  else task.wait(.02)end
+ end
+ local success=packed and packed[1]==true
+ if success then
+  local ok,e=pcall(function()
+   local result=packed[2]or{}
+   contextoAtual=ctx;registrarVersoes(ev,result);contextoAtual=anterior
+   if ctx.afterRun then pcall(ctx.afterRun,result)end
+
+   pcall(live.aposEscrita,ev,result)
+   packed[2]=result
+  end)
+  if not ok then success=false;packed={false,e,n=2}end
+ elseif ctx.afterRun and type(packed[2])=='table' then pcall(ctx.afterRun,packed[2])end
+ if contextoAtual==ctx then contextoAtual=anterior end
+ if limparContexto(ctx)then dono:finish(ctx,success)
+ else
+  reterContexto(ctx)
+  error({code='CLEANUP_FAILED',message='Falha ao encerrar esta execucao; suas travas ficam retidas e serao liberadas assim que a limpeza concluir. Outras chamadas continuam funcionando.',nothingExecuted=false},0)
+ end
+ if not success then error(packed and packed[2]or'erro desconhecido',0)end
+ return packed[2]
+end
+local function executar(ev)
+ local begin=os.clock();ultimaFerramenta=tostring(ev.tool or '?')
+ local ok,res=pcall(executarProtegido,ev)
+ local item={reqId=ev.reqId,ok=ok,ms=math.floor((os.clock()-begin)*1000)}
+ if ok then item.resultado=res or{ok=true};contaOk=contaOk+1 else item.erro=res;ultimoErro=textoErro(res);contaErro=contaErro+1 end
+ item=medirItem(item)
+ local cached=cacheEventos[ev.reqId];if cached and not cached.acked then cached.result=item;cached.event=nil end
+ if ev.generation==geracao then table.insert(bufferRespostas,item);enviarRespostas()end
+ atualizarUi()
+end
+local consumir
+local function concluirExecucao(ev)
+ if execucoes[ev]then execucoes[ev]=nil;emExecucao=math.max(0,emExecucao-1)end
+ task.defer(consumir)
+end
+local function lancar(ev)
+ local t=task.spawn(function()
+  local ok,e=pcall(executar,ev)
+  if not ok then
+   ultimoErro='Falha interna: '..textoErro(e)
+   if ev.context and not ev.context.done then reterContexto(ev.context)end
+   if ev.generation==geracao then table.insert(bufferRespostas,medirItem({reqId=ev.reqId,ok=false,erro=ultimoErro}));enviarRespostas()end
+  end
+  concluirExecucao(ev)
+ end)
+
+ if execucoes[ev] then execucoes[ev]=t end
+end
+
+local function varrerOrfaos()
+ local agora=os.clock()
+ local perdidas=0
+ for ev,t in pairs(execucoes)do
+  local morta=(t==true) or not threadViva(t)
+  if morta and agora>=ev.deadline+GRACA_ORFAO then
+   execucoes[ev]=nil;emExecucao=math.max(0,emExecucao-1);perdidas=perdidas+1
+   if ev.context and not ev.context.done then ev.context.cancelled=true;reterContexto(ev.context)end
+   local cached=cacheEventos[ev.reqId]
+   if ev.generation==geracao and not (cached and (cached.result or cached.acked)) then
+    local item=medirItem({reqId=ev.reqId,ok=false,erro={code='EXECUTION_LOST',message='A execucao foi perdida (a thread morreu ou o Studio a encerrou num congelamento). O estado pode ter sido alterado; confira antes de repetir.',nothingExecuted=false,executionUnknown=true}})
+    if cached then cached.result=item;cached.event=nil end
+    table.insert(bufferRespostas,item)
+   end
+   contaErro=contaErro+1
+  end
+ end
+ tentarLimpezasPendentes()
+ if #bufferRespostas>0 then enviarRespostas()end
+ if #filaLocal>0 then consumir()end
+ atualizarUi()
+ return perdidas
+end
+local function supervisionar(generation)
+ while conectado and generation==geracao do
+  task.wait(1)
+  if not conectado or generation~=geracao then break end
+  pcall(varrerOrfaos)
+ end
+end
+consumir=function()
+ if threadViva(consumindoThread) then return end
+ if #filaLocal==0 or emExecucao>=MAX_PARALELO then atualizarUi();return end
+ consumindoThread=task.spawn(function()
+  while #filaLocal>0 and emExecucao<MAX_PARALELO do
+   local rodada={}
+   while #filaLocal>0 and emExecucao+#rodada<MAX_PARALELO do
+    local ev=table.remove(filaLocal,1)
+    if eventoValido(ev) then table.insert(rodada,ev)
+    else
+
+     execucoes[ev]=true;emExecucao=emExecucao+1;lancar(ev)
+    end
+   end
+   if #rodada>0 then
+    for _,ev in ipairs(rodada)do execucoes[ev]=true;emExecucao=emExecucao+1 end
+    pedirTickets(rodada)
+    for _,ev in ipairs(rodada)do lancar(ev)end
+   end
+   atualizarUi()
+  end
+ end)
+end
+local function podarCache()
+ while #ordemEventos>MAX_CACHE do
+  local id=ordemEventos[1];local cached=cacheEventos[id]
+  if cached and cached.event and not cached.result then break end
+  table.remove(ordemEventos,1);cacheEventos[id]=nil
+ end
+end
+
+local bootWorker=nil
+local function anotarSessao(resp)
+ if type(resp)~='table' then return end
+ pcall(function()
+  if type(resp.alias)=='string' then script:SetAttribute('MCPAlias',resp.alias)end
+  if tonumber(resp.studiosOnline) then script:SetAttribute('MCPStudios',tonumber(resp.studiosOnline))end
+ end)
+ if type(resp.boot)=='string' and resp.boot~='' then
+  if bootWorker~=nil and bootWorker~=resp.boot then
+   bootWorker=resp.boot
+   pcall(reiniciarBackfillRelay,200)
+  else bootWorker=resp.boot end
+ end
+end
+local function receber(response,generation)
+ anotarSessao(response)
+ for _,id in ipairs(response.cancels or{})do local cached=cacheEventos[id];if cached and cached.event then cached.event.cancelled=true end end
+ for _,ev in ipairs(response.events or{})do
+  if type(ev.reqId)=='string'then
+   local cached=cacheEventos[ev.reqId]
+   if cached then if cached.result then table.insert(bufferRespostas,cached.result)end
+   else
+    ev.generation=generation;ev.args=ev.args or{};ev.deadline=os.clock()+math.max(0,tonumber(ev.prazoMs)or 0)/1000
+    if type(ev.ticket)=='table' and (ev.ticket.ok~=true or ev.ticket.agent~=ev.agent) then ev.ticket=nil end
+    cacheEventos[ev.reqId]={event=ev};table.insert(ordemEventos,ev.reqId);table.insert(filaLocal,ev)
+   end
+  end
+ end
+ podarCache()
+ consumir();if #bufferRespostas>0 then enviarRespostas()end
+end
+local function laco(generation)
+ local base,secret=urlBase,chave
+ local tentativa=0
+ while conectado and generation==geracao do
+  local hello,e=pedir('ola',identidade(),base,secret)
+  if hello and hello.ok==true then
+   controle:configure(hello.controle);esperaMs=math.clamp(tonumber(hello.esperaMs)or 25000,1000,30000)
+   anotarSessao(hello)
+
+   iniciarRelay('edit',hello.backfill==true)
+   break
+  end
+  if generation~=geracao then return end
+  local motivo=e or (hello and (hello.erro and (type(hello.erro)=='table' and hello.erro.message or hello.erro)) or 'Worker recusou conexao')
+  if erroDefinitivo(e) or tentativa>=60 then conectado=false;ultimoErro=tostring(motivo);atualizarUi();return end
+  tentativa=tentativa+1;ultimoErro='reconectando ('..tentativa..'): '..tostring(motivo);atualizarUi()
+  task.wait(math.min(30,2^math.min(tentativa,5)))
+ end
+ if not conectado or generation~=geracao then return end
+ local backoff=1
+ while conectado and generation==geracao do
+  local body=identidade();body.wait=esperaMs
+  local lote=nil
+  if #bufferRespostas>0 then lote=retirarLote();body.itens=lote end
+  local response,err=pedir('poll',body,base,secret)
+  if not conectado or generation~=geracao then if lote then devolverLote(lote)end;break end
+  if err then
+   if lote then tratarFalhaLote(lote,err)end
+   ultimoErro=err;atualizarUi();task.wait(math.min(15,backoff));backoff=backoff*2
+  else
+   if lote then confirmar(lote)end
+   backoff=1;ultimoErro='';receber(response,generation);atualizarUi();task.wait(.05)
+  end
+ end
+end
+local function normalizar(txt)
+ return tostring(txt or ''):gsub('%s+',''):gsub('[?#].*$',''):gsub('/+$',''):gsub('/estado$',''):gsub('/poll$',''):gsub('/mcp/','/ponte/')
+end
+local function cancelarTudo()
+ for ev in pairs(execucoes)do ev.cancelled=true end
+ for _,ev in ipairs(filaLocal)do ev.cancelled=true end
+end
+local function conectar(txt)
+ local u=normalizar(txt)
+ if not string.match(u,'^https?://[^/]+/ponte/[%w_-]+/[%w_-]+$')then ultimoErro='Cole https://.../mcp/SESSAO/TOKEN';atualizarUi();return false end
+ if conectado then ultimoErro='Desconecte antes de reconectar.';atualizarUi();return false end
+
+ cancelarTudo()
+
+ peer=string.sub(HttpService:GenerateGUID(false):gsub('[{}-]',''),1,12)
+ porId=setmetatable({},{__mode='v'});porInst=setmetatable({},{__mode='k'});proximoId=0
+ filaLocal={};bufferRespostas={};cacheEventos={};ordemEventos={};controle=novoControle();bootWorker=nil
+ urlBase=u;geracao=geracao+1;conectado=true;ultimoErro=''
+ plugin:SetSetting('mcpUrl',u);plugin:SetSetting('mcpChave',chave);plugin:SetSetting('mcpAuto',true)
+ local generation=geracao
+ task.spawn(function()
+
+  local quedas=0
+  while conectado and generation==geracao do
+   local ok,e=pcall(laco,generation)
+   if not conectado or generation~=geracao then break end
+   quedas=quedas+1
+   ultimoErro=(ok and 'Laco encerrou; religando' or ('Laco caiu: '..textoErro(e)))..' ('..quedas..')';atualizarUi()
+   task.wait(math.min(30,2*quedas))
+  end
+ end)
+
+ task.spawn(function()
+  while conectado and generation==geracao do
+   pcall(supervisionar,generation)
+   if conectado and generation==geracao then task.wait(2)end
+  end
+ end)
+ atualizarUi();return true
+end
+local function desconectar()
+ local base,secret,oldPeer=urlBase,chave,peer;conectado=false;geracao=geracao+1
+ cancelarTudo();pararRelay()
+ filaLocal={};bufferRespostas={}
+ plugin:SetSetting('mcpAuto',false)
+ if base~=''then task.spawn(function()pcall(pedir,'tchau',{peer=oldPeer},base,secret)end)end
+ atualizarUi()
+end
+
+
+local RunServiceRelay=game:GetService('RunService')
+local StudioTestServiceRelay=nil
+pcall(function()StudioTestServiceRelay=game:GetService('StudioTestService')end)
+local RELAY_ESPERA_COMANDOS_MS=5000
+local RELAY_DEBOUNCE=0.3
+local RELAY_INTERVALO_MIN=0.5
+local RELAY_MAX_PENDENTES=3000
+local RELAY_MAX_LOTE=200
+local RELAY_MAX_MENSAGEM=20000
+local relayAtivo=false
+local relayGeracao=0
+local relayId=string.sub(string.gsub(HttpService:GenerateGUID(false),'[{}-]',''),1,12)
+local relayCtx='edit'
+local relayLogs,relayResultados,relayDescartados={},{},0
+local relayFlushAgendado,relayForcar=false,false
+local relayUltimoEnvio=0
+local relayConexaoLog=nil
+local relayTestArgs=nil
+
+local hist={n=0,last=nil,pend={},fila={},intervalo=1.0,ttl=15,loteMax=RELAY_MAX_LOTE,loteBytes=400*1024,falhas=0,reenvio=0,pedido=nil,ocupado=false,denovo=false}
+local function agoraMsRelay()return DateTime.now().UnixTimestampMillis end
+local NIVEL_LOG={}
+pcall(function()
+ NIVEL_LOG[Enum.MessageType.MessageOutput]='output';NIVEL_LOG[Enum.MessageType.MessageInfo]='info'
+ NIVEL_LOG[Enum.MessageType.MessageWarning]='warning';NIVEL_LOG[Enum.MessageType.MessageError]='error'
+end)
+local function nivelDe(kind)
+ local n=NIVEL_LOG[kind];if n then return n end
+ local s=tostring(kind)
+ if string.find(s,'Error',1,true)then return 'error'elseif string.find(s,'Warning',1,true)then return 'warning'elseif string.find(s,'Info',1,true)then return 'info'end
+ return 'output'
+end
+local function relayCorpo(extra)
+ local body={relayId=relayId,ctx=relayCtx,peer=peer,placeId=game.PlaceId,place=game.Name,versao=VERSAO}
+ if relayTestArgs~=nil then
+  body.testArgs=codificar(relayTestArgs)
+  if type(relayTestArgs)=='table' and type(relayTestArgs.testId)=='string' then body.testId=relayTestArgs.testId end
+ end
+ if relayCtx=='edit' then body.teste=estadoTeste()end
+ for k,v in pairs(extra or {})do body[k]=v end
+ return body
+end
+local relayFlush,executarComandos,reconciliarHistorico
+local relayFlushAgendadoEm=0
+local function agendarFlush()
+ if not relayAtivo then return end
+
+ if relayFlushAgendado and os.clock()-relayFlushAgendadoEm<10 then return end
+ relayFlushAgendado=true;relayFlushAgendadoEm=os.clock()
+ local gen=relayGeracao
+ local espera=math.max(RELAY_DEBOUNCE,RELAY_INTERVALO_MIN-(os.clock()-relayUltimoEnvio))
+ task.delay(espera,function()
+  relayFlushAgendado=false
+  if gen==relayGeracao and relayAtivo then relayFlush(gen)end
+ end)
+end
+local function chaveLog(level,message)return level..'\0'..message end
+local function guardarLinha(t,level,message)
+ if #relayLogs>=RELAY_MAX_PENDENTES then table.remove(relayLogs,1);relayDescartados=relayDescartados+1 end
+ table.insert(relayLogs,{t=t,level=level,message=message})
+end
+
+local function empilharLog(message,kind,t)
+ if not relayAtivo then return end
+ local level=nivelDe(kind);local msg=string.sub(tostring(message),1,RELAY_MAX_MENSAGEM)
+ guardarLinha(t or agoraMsRelay(),level,msg)
+ local key=chaveLog(level,msg)
+ hist.pend[key]=(hist.pend[key] or 0)+1
+ table.insert(hist.fila,{key=key,t=os.clock()})
+ if #hist.fila>RELAY_MAX_PENDENTES then
+  local velha=table.remove(hist.fila,1);local c=hist.pend[velha.key]
+  if c and c>1 then hist.pend[velha.key]=c-1 else hist.pend[velha.key]=nil end
+ end
+ agendarFlush()
+end
+local function mesmaEntrada(a,b)return a~=nil and b~=nil and a.message==b.message and a.messageType==b.messageType and a.timestamp==b.timestamp end
+local function posicionarHistorico(lista,limite)
+ local n=#lista;local c=math.max(0,n-limite)
+ hist.n=c;hist.last=c>0 and lista[c] or nil
+end
+
+local function passoHistorico()
+ local ok,lista=pcall(function()return LogService:GetLogHistory()end)
+ if not ok or type(lista)~='table' then return 0 end
+ local reenviar=false
+ if hist.pedido then local lim=hist.pedido;hist.pedido=nil;posicionarHistorico(lista,lim);reenviar=lim>0 end
+ local n=#lista
+ if n==0 then hist.n=0;hist.last=nil;return 0 end
+ local inicio
+ if hist.last==nil then inicio=1
+ elseif hist.n>=1 and hist.n<=n and mesmaEntrada(lista[hist.n],hist.last) then inicio=hist.n+1
+ else
+
+  inicio=1
+  for i=math.min(n,hist.n),1,-1 do if mesmaEntrada(lista[i],hist.last) then inicio=i+1;break end end
+ end
+ local agora=os.clock()
+ while #hist.fila>0 and agora-hist.fila[1].t>hist.ttl do
+  local velha=table.remove(hist.fila,1);local c=hist.pend[velha.key]
+  if c and c>1 then hist.pend[velha.key]=c-1 else hist.pend[velha.key]=nil end
+ end
+ local novas=0;local orcamento=novoOrcamento()
+ for i=inicio,n do
+  respirar(orcamento)
+  local l=lista[i];local level=nivelDe(l.messageType);local msg=string.sub(tostring(l.message),1,RELAY_MAX_MENSAGEM)
+  local key=chaveLog(level,msg);local c=hist.pend[key]
+  if c then
+   if c>1 then hist.pend[key]=c-1 else hist.pend[key]=nil end
+   for j=1,#hist.fila do if hist.fila[j].key==key then table.remove(hist.fila,j);break end end
+  else
+   local t=tonumber(l.timestamp);t=t and math.floor(t*1000) or agoraMsRelay()
+   guardarLinha(t,level,msg);novas=novas+1
+  end
+ end
+ hist.n=n;hist.last=lista[n]
+ if reenviar then hist.reenvio=hist.reenvio+novas end
+ return novas
+end
+reconciliarHistorico=function(forcarFlush)
+ if not relayAtivo then return 0 end
+
+ if hist.ocupado then hist.denovo=true;return 0 end
+ hist.ocupado=true
+ local total=0
+ local ok,e=pcall(function()
+  repeat hist.denovo=false;total=total+passoHistorico() until not hist.denovo and not hist.pedido
+ end)
+ hist.ocupado=false
+ if not ok then ultimoErro='relay historico: '..tostring(e)end
+ if total>0 or forcarFlush then agendarFlush()end
+ return total
+end
+local function devolverLote(logs,resultados,descartados,reenvio)
+ for i=#logs,1,-1 do table.insert(relayLogs,1,logs[i])end
+ for _,r in ipairs(resultados)do table.insert(relayResultados,r)end
+ relayDescartados=relayDescartados+descartados;hist.reenvio=hist.reenvio+reenvio
+end
+relayFlush=function(gen)
+ if gen~=relayGeracao or not relayAtivo then return end
+
+ reconciliarHistorico(false)
+ if gen~=relayGeracao or not relayAtivo then return end
+ if #relayLogs==0 and #relayResultados==0 and not relayForcar then return end
+ relayForcar=false
+ local logs,bytes={},0
+ while #logs<hist.loteMax and #relayLogs>0 do
+  local prox=relayLogs[1];local tam=#prox.message+64
+  if #logs>0 and bytes+tam>hist.loteBytes then break end
+  table.insert(logs,table.remove(relayLogs,1));bytes=bytes+tam
+ end
+ local resultados=relayResultados;relayResultados={}
+ local descartados=relayDescartados;relayDescartados=0
+ local reenvio=hist.reenvio;hist.reenvio=0
+ relayUltimoEnvio=os.clock()
+ local corpo=relayCorpo({logs=logs,resultados=resultados,descartados=descartados,wait=0})
+ if reenvio>0 then corpo.backfill=reenvio end
+ local resposta,err=pedir('relay',corpo)
+ if gen~=relayGeracao then return end
+ if err then
+  hist.falhas=hist.falhas+1
+  if relayCtx=='edit' then ultimoErro='relay: '..tostring(err)end
+  local grande=#logs>1 and (bytes>64*1024 or erroDefinitivo(err))
+  if grande then
+
+   hist.loteMax=math.max(1,math.floor(#logs/2))
+   devolverLote(logs,resultados,descartados,reenvio)
+  elseif #logs==1 and (erroDefinitivo(err) or hist.falhas>=5) then
+
+   local culpada=logs[1]
+   devolverLote({},resultados,descartados+1,reenvio)
+   if #culpada.message>2048 then guardarLinha(culpada.t,'warning','[mcp] linha de '..#culpada.message..' caracteres descartada pelo relay: '..string.sub(tostring(err),1,120))end
+   hist.falhas=0
+  else devolverLote(logs,resultados,descartados,reenvio)end
+  task.delay(2,function()if gen==relayGeracao then relayForcar=true;agendarFlush()end end)
+  return
+ end
+ hist.falhas=0
+ if hist.loteMax<RELAY_MAX_LOTE then hist.loteMax=math.min(RELAY_MAX_LOTE,hist.loteMax*2)end
+ anotarSessao(resposta)
+ if type(resposta)=='table' and type(resposta.comandos)=='table' and #resposta.comandos>0 then executarComandos(resposta.comandos)end
+ if #relayLogs>0 or #relayResultados>0 then agendarFlush()end
+end
+local executorRelay=nil
+local function executarComando(cmd)
+ local tipo=tostring(cmd.tipo or '')
+ if tipo=='ping' then
+  return {ctx=relayCtx,isServer=RunServiceRelay:IsServer(),isClient=RunServiceRelay:IsClient(),isRunMode=RunServiceRelay:IsRunMode(),isRunning=RunServiceRelay:IsRunning(),isEdit=RunServiceRelay:IsEdit(),place=game.Name,placeId=game.PlaceId,testArgs=codificar(relayTestArgs)}
+ end
+ if tipo=='backfill' then
+
+  local n=reiniciarBackfillRelay(cmd.limite)
+  return {backfill=true,lines=n,ctx=relayCtx}
+ end
+ if tipo=='endTest' then
+  if not StudioTestServiceRelay then error({code='TEST_API_UNAVAILABLE',message='StudioTestService indisponivel neste Studio; pare pelo botao Stop.'},0)end
+  if RunServiceRelay:IsServer() or RunServiceRelay:IsRunMode() then
+   StudioTestServiceRelay:EndTest(cmd.valor~=nil and cmd.valor or 'mcp_stop');return {ended=true,ctx=relayCtx}
+  end
+  if StudioTestServiceRelay:CanLeaveTest() then StudioTestServiceRelay:LeaveTest();return {left=true,ctx=relayCtx}end
+  error({code='WRONG_CONTEXT',message='EndTest so pode ser chamado no servidor da sessao.'},0)
+ end
+ if tipo=='pause' then RunServiceRelay:Pause();return {paused=true,ctx=relayCtx}end
+ if tipo=='resume' then RunServiceRelay:Run();return {resumed=true,ctx=relayCtx}end
+ if tipo=='luau' then
+  if type(loadstring)~='function' or type(setfenv)~='function' then error({code='LUAU_UNAVAILABLE',message='loadstring/setfenv indisponiveis neste DataModel.'},0)end
+
+  executorRelay=executorRelay or criarRunLuau({task=task,clock=os.clock,compile=loadstring,setEnvironment=setfenv,environment=getfenv(),log=LogService.MessageOut,encode=codificar,history=function(_,fn)return fn()end,require=require,source=fonteDe,path=caminhoDe,freshDefault=false,frame=quadroCompartilhado})
+  local timeout=math.clamp(tonumber(cmd.timeoutMs)or 30000,100,40000)/1000
+  local ctx={agent=cmd.agent,cleanups={},recordings={},deadline=os.clock()+timeout,cancelled=false,done=false}
+  local ok,res=pcall(executorRelay,{code=cmd.code,freshRequire=cmd.freshRequire,undoLabel=cmd.undoLabel},ctx)
+  ctx.done=true
+  for i=#ctx.cleanups,1,-1 do pcall(ctx.cleanups[i])end
+  if not ok then error(res,0)end
+  res.context=relayCtx;return res
+ end
+ error({code='UNKNOWN_COMMAND',message='comando desconhecido: '..tipo},0)
+end
+executarComandos=function(comandos)
+ for _,cmd in ipairs(comandos)do
+  if type(cmd)=='table' and cmd.id~=nil then
+   task.spawn(function()
+    local ok,res=pcall(executarComando,cmd)
+    local item={id=cmd.id,ok=ok}
+    if ok then item.resultado=res or {ok=true}
+    else item.erro=(type(res)=='table') and res or {code='RELAY_ERROR',message=tostring(res)}end
+    table.insert(relayResultados,item);relayForcar=true;agendarFlush()
+   end)
+  end
+ end
+end
+local function relayLacoComandos(gen)
+ local backoff=1
+ while relayAtivo and gen==relayGeracao do
+  local resposta,err=pedir('relay',relayCorpo({wait=RELAY_ESPERA_COMANDOS_MS}))
+  if not relayAtivo or gen~=relayGeracao then return end
+  if err then task.wait(math.min(15,backoff));backoff=backoff*2
+  else
+   backoff=1
+   anotarSessao(resposta)
+   if type(resposta)=='table' and type(resposta.comandos)=='table' and #resposta.comandos>0 then executarComandos(resposta.comandos)end
+   task.wait(0.05)
+  end
+ end
+end
+
+local function relayLacoHistorico(gen)
+ while relayAtivo and gen==relayGeracao do
+  task.wait(hist.intervalo)
+  if not relayAtivo or gen~=relayGeracao then return end
+  pcall(reconciliarHistorico,false)
+ end
+end
+pararRelay=function()
+ if not relayAtivo then return end
+ relayAtivo=false;relayGeracao=relayGeracao+1
+ if relayConexaoLog then pcall(function()relayConexaoLog:Disconnect()end);relayConexaoLog=nil end
+ relayLogs={};relayResultados={};relayDescartados=0;relayFlushAgendado=false;relayForcar=false
+ hist.pend={};hist.fila={};hist.reenvio=0;hist.pedido=nil;hist.ocupado=false;hist.denovo=false
+end
+iniciarRelay=function(ctx,backfill,testArgs)
+ pararRelay()
+ relayGeracao=relayGeracao+1;local gen=relayGeracao
+ relayCtx=ctx;relayTestArgs=testArgs;relayAtivo=true
+ hist.loteMax=RELAY_MAX_LOTE;hist.falhas=0
+
+ hist.pedido=backfill and (ctx=='edit' and 200 or 500) or 0
+ relayConexaoLog=LogService.MessageOut:Connect(function(message,kind)empilharLog(message,kind)end)
+ task.spawn(relayLacoComandos,gen)
+ task.spawn(relayLacoHistorico,gen)
+ relayForcar=true
+ reconciliarHistorico(true)
+end
+
+reiniciarBackfillRelay=function(limite)
+ if not relayAtivo then return 0 end
+ limite=math.clamp(math.floor(tonumber(limite) or 200),1,500)
+ relayLogs={};hist.pend={};hist.fila={};hist.pedido=limite
+ relayForcar=true
+ return reconciliarHistorico(true)
+end
+acordarRelay=function()
+ if relayAtivo then relayForcar=true;agendarFlush()end
+end
+
+if not RunServiceRelay:IsEdit() then
+ local salvaUrl=plugin:GetSetting('mcpUrl')
+ local salvaChave=plugin:GetSetting('mcpChave')
+ local urlNormalizada=type(salvaUrl)=='string' and (normalizar(salvaUrl)) or ''
+ if plugin:GetSetting('mcpAuto')==true and string.match(urlNormalizada,'^https?://[^/]+/ponte/[%w_-]+/[%w_-]+$') then
+  urlBase=urlNormalizada
+  chave=type(salvaChave)=='string' and salvaChave or ''
+  conectado=true
+  local ctx=RunServiceRelay:IsServer() and 'server' or 'client'
+  local args=nil
+  if StudioTestServiceRelay then pcall(function()args=StudioTestServiceRelay:GetTestArgs()end)end
+  iniciarRelay(ctx,true,args)
+ end
+ return
+end
+
+
+local FUNDO = Color3.fromRGB(46, 46, 46)
+local CAMPO = Color3.fromRGB(30, 30, 30)
+local TEXTO = Color3.fromRGB(235, 235, 235)
+local FRACO = Color3.fromRGB(160, 160, 160)
+
+local barra = plugin:CreateToolbar("MCP")
+local botaoBarra = barra:CreateButton("MCP Studio", "Conectar o Studio ao seu Worker MCP", "")
+botaoBarra.ClickableWhenViewportHidden = true
+
+local info = DockWidgetPluginGuiInfo.new(Enum.InitialDockState.Float, false, true, 420, 280, 340, 240)
+local janela = plugin:CreateDockWidgetPluginGui("MCPStudioNotion", info)
+janela.Title = "MCP Studio (Notion)"
+janela.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+local raiz = Instance.new("Frame")
+raiz.Size = UDim2.fromScale(1, 1)
+raiz.BackgroundColor3 = FUNDO
+raiz.BorderSizePixel = 0
+raiz.Parent = janela
+
+local pad = Instance.new("UIPadding")
+pad.PaddingTop = UDim.new(0, 10)
+pad.PaddingBottom = UDim.new(0, 10)
+pad.PaddingLeft = UDim.new(0, 10)
+pad.PaddingRight = UDim.new(0, 10)
+pad.Parent = raiz
+
+local coluna = Instance.new("UIListLayout")
+coluna.FillDirection = Enum.FillDirection.Vertical
+coluna.Padding = UDim.new(0, 6)
+coluna.SortOrder = Enum.SortOrder.LayoutOrder
+coluna.Parent = raiz
+
+local function rotulo(texto, ordem, cor, tamanho)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Size = UDim2.new(1, 0, 0, tamanho or 16)
+	l.Font = Enum.Font.SourceSans
+	l.TextSize = 14
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.TextYAlignment = Enum.TextYAlignment.Top
+	l.TextColor3 = cor or TEXTO
+	l.Text = texto
+	l.TextWrapped = true
+	l.LayoutOrder = ordem
+	l.Parent = raiz
+	return l
+end
+
+rotulo("URL do MCP (a mesma que voce colou no Notion)", 1, FRACO)
+
+local caixaUrl = Instance.new("TextBox")
+caixaUrl.Size = UDim2.new(1, 0, 0, 28)
+caixaUrl.BackgroundColor3 = CAMPO
+caixaUrl.BorderSizePixel = 0
+caixaUrl.TextColor3 = TEXTO
+caixaUrl.PlaceholderText = "https://seu-worker.workers.dev/mcp/sessao/token"
+caixaUrl.Font = Enum.Font.Code
+caixaUrl.TextSize = 13
+caixaUrl.ClearTextOnFocus = false
+caixaUrl.TextXAlignment = Enum.TextXAlignment.Left
+caixaUrl.TextTruncate = Enum.TextTruncate.AtEnd
+caixaUrl.Text = ""
+caixaUrl.LayoutOrder = 2
+caixaUrl.Parent = raiz
+
+local padUrl = Instance.new("UIPadding")
+padUrl.PaddingLeft = UDim.new(0, 6)
+padUrl.PaddingRight = UDim.new(0, 6)
+padUrl.Parent = caixaUrl
+
+local linhaBotoes = Instance.new("Frame")
+linhaBotoes.Size = UDim2.new(1, 0, 0, 30)
+linhaBotoes.BackgroundTransparency = 1
+linhaBotoes.LayoutOrder = 3
+linhaBotoes.Parent = raiz
+
+local linha = Instance.new("UIListLayout")
+linha.FillDirection = Enum.FillDirection.Horizontal
+linha.Padding = UDim.new(0, 6)
+linha.VerticalAlignment = Enum.VerticalAlignment.Center
+linha.Parent = linhaBotoes
+
+local function botao(texto, largura, ordem)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(0, largura, 1, 0)
+	b.BackgroundColor3 = Color3.fromRGB(0, 122, 204)
+	b.BorderSizePixel = 0
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.SourceSansSemibold
+	b.TextSize = 14
+	b.Text = texto
+	b.AutoButtonColor = true
+	b.LayoutOrder = ordem
+	b.Parent = linhaBotoes
+	local canto = Instance.new("UICorner")
+	canto.CornerRadius = UDim.new(0, 4)
+	canto.Parent = b
+	return b
+end
+
+local botaoConectar = botao("Conectar", 110, 1)
+local botaoTeste = botao("Testar", 80, 2)
+botaoTeste.BackgroundColor3 = Color3.fromRGB(70, 70, 70)
+
+local pontoLinha = Instance.new("Frame")
+pontoLinha.Size = UDim2.new(1, 0, 0, 18)
+pontoLinha.BackgroundTransparency = 1
+pontoLinha.LayoutOrder = 4
+pontoLinha.Parent = raiz
+
+local ponto = Instance.new("Frame")
+ponto.Size = UDim2.fromOffset(10, 10)
+ponto.Position = UDim2.fromOffset(0, 4)
+ponto.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
+ponto.BorderSizePixel = 0
+ponto.Parent = pontoLinha
+
+local cantoPonto = Instance.new("UICorner")
+cantoPonto.CornerRadius = UDim.new(1, 0)
+cantoPonto.Parent = ponto
+
+local labelStatus = Instance.new("TextLabel")
+labelStatus.BackgroundTransparency = 1
+labelStatus.Position = UDim2.fromOffset(18, 0)
+labelStatus.Size = UDim2.new(1, -18, 1, 0)
+labelStatus.Font = Enum.Font.SourceSansSemibold
+labelStatus.TextSize = 14
+labelStatus.TextXAlignment = Enum.TextXAlignment.Left
+labelStatus.TextColor3 = TEXTO
+labelStatus.Text = "desconectado"
+labelStatus.Parent = pontoLinha
+
+local detalhe = rotulo("", 5, FRACO, 60)
+local rodape = rotulo("", 6, FRACO, 34)
+
+atualizarUi = function()
+	if conectado then
+		ponto.BackgroundColor3 = ultimoErro ~= "" and Color3.fromRGB(230, 160, 40) or Color3.fromRGB(60, 200, 90)
+		labelStatus.Text = ultimoErro ~= "" and "atencao" or "conectado"
+		botaoConectar.Text = "Desconectar"
+		botaoConectar.BackgroundColor3 = Color3.fromRGB(120, 60, 60)
+	else
+		ponto.BackgroundColor3 = Color3.fromRGB(150, 150, 150)
+		labelStatus.Text = "desconectado"
+		botaoConectar.Text = "Conectar"
+		botaoConectar.BackgroundColor3 = Color3.fromRGB(0, 122, 204)
+	end
+	local alias, studios = "", 0
+	pcall(function()
+		alias = conectado and tostring(script:GetAttribute("MCPAlias") or "") or ""
+		studios = conectado and (tonumber(script:GetAttribute("MCPStudios")) or 0) or 0
+	end)
+	local linhas = {
+		"place: " .. game.Name .. (alias ~= "" and ("   alias " .. alias) or "") .. (studios > 1 and ("  (" .. studios .. " Studios nesta sessao)") or "") .. "   plugin " .. VERSAO .. "   sessao " .. peer,
+		"chamadas: " .. contaOk .. " ok / " .. contaErro .. " com erro" .. (ultimaFerramenta ~= "" and ("   ultima: " .. ultimaFerramenta) or ""),
+		"em execucao: " .. emExecucao .. "/" .. MAX_PARALELO .. "   fila: " .. #filaLocal .. (#limpezasPendentes > 0 and ("   limpezas pendentes: " .. #limpezasPendentes) or ""),
+	}
+	detalhe.Text = table.concat(linhas, "\n")
+		local st = estadoTeste()
+		local sessao = (st and st.active) and ("   teste: " .. tostring(st.mode) .. " ativo") or ""
+		rodape.Text = ultimoErro ~= "" and ("aviso: " .. ultimoErro) or ("" .. #NOMES .. " ferramentas | logs unificados | play test" .. sessao)
+end
+
+botaoConectar.MouseButton1Click:Connect(function()
+	if conectado then
+		desconectar()
+	else
+		conectar(caixaUrl.Text)
+	end
+end)
+
+botaoTeste.MouseButton1Click:Connect(function()
+	local u = normalizar(caixaUrl.Text)
+	if not string.find(u, "/ponte/", 1, true) then
+		ultimoErro = "cole a URL completa antes de testar"
+		atualizarUi()
+		return
+	end
+	task.spawn(function()
+		if conectado and u ~= urlBase then ultimoErro="Desconecte antes de testar outra URL";atualizarUi();return end
+		local dados, erro = pedir("estado", nil,u,chave)
+		if erro ~= nil then
+			ultimoErro = erro
+		else
+			ultimoErro = ""
+			local faltando = (dados.ferramentasFaltando ~= nil and #dados.ferramentasFaltando or 0)
+			print("[MCP Studio] " .. tostring(dados.servidor) .. " respondeu; Studio online: " .. tostring(dados.studioOnline))
+		end
+
+		atualizarUi()
+	end)
+end)
+
+caixaUrl.FocusLost:Connect(function(enter)
+	plugin:SetSetting("mcpUrl", caixaUrl.Text)
+	if enter and not conectado then
+		conectar(caixaUrl.Text)
+	end
+end)
+
+botaoBarra.Click:Connect(function()
+	janela.Enabled = not janela.Enabled
+end)
+
+janela:GetPropertyChangedSignal("Enabled"):Connect(function()
+	botaoBarra:SetActive(janela.Enabled)
+end)
+
+plugin.Unloading:Connect(function()
+ conectado=false;geracao=geracao+1
+ cancelarTudo();pararRelay()
+ filaLocal={};bufferRespostas={}
+end)
+
+local salvaUrl = plugin:GetSetting("mcpUrl")
+if type(salvaUrl) == "string" then
+	caixaUrl.Text = salvaUrl
+end
+local salvaChave = plugin:GetSetting("mcpChave")
+if chave == "" and type(salvaChave) == "string" then
+	chave = salvaChave
+end
+
+atualizarUi()
+
+if plugin:GetSetting("mcpAuto") == true and type(salvaUrl) == "string" and salvaUrl ~= "" then
+	task.defer(function()
+		conectar(salvaUrl)
+	end)
+end

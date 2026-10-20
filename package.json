@@ -1,0 +1,22 @@
+{
+  "name": "roblox-studio-mcp-controlado",
+  "version": "2.9.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "check": "node --check worker.js && node --check ferramentas.js && node --check toolbox.js && node --check formato.js",
+    "test": "node --test tests/worker.test.mjs",
+    "test:lua": "python3 tests/runner-lua.py",
+    "test:all": "npm run build && npm run check && npm test && npm run test:lua",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "url": "node tools/gerar-endereco.mjs"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

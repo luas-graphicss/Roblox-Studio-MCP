@@ -1,0 +1,32 @@
+name = "roblox-studio-mcp"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+[observability]
+enabled = false
+
+[[durable_objects.bindings]]
+name = "SESSOES"
+class_name = "SessaoStudio"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SessaoStudio"]
+
+[vars]
+
+TEMPO_LIMITE_MS = "45000"
+
+ESPERA_POLL_MS = "25000"
+
+FILA_MAX = "200"
+
+MAX_RESULTADO = "120000"
+
+JANELA_PAR_MS = "90000"
+
+TRAVA_LEITURA_GRACA_S = "8"
+
+TRAVA_MANUAL_S = "120"
+TRAVA_MAX_S = "900"
